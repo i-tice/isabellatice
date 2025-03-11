@@ -1,0 +1,467 @@
+---
+title: "p3"
+format: html
+editor: visual
+---
+
+## **Load libraries**
+
+```{r, warning=FALSE, message=FALSE}
+
+library(tidyverse)
+library(here)
+library(knitr)
+library(srvyr)
+library(mlogit)
+library(caret)
+library(pscl)
+
+here("code",
+     "mlogit_helpers.R") |>
+  source()
+```
+
+## **Load datasets**
+
+```{r}
+hh_data <- here("data",
+                "NHTS",
+                "hhpub.csv") |>
+  read_csv(show_col_types = FALSE) |>
+  filter(TRAVDAY != "01",
+          TRAVDAY != "07")
+
+person_data <- here("data",
+                    "NHTS",
+                    "perpub.csv") |>
+  read_csv(show_col_types = FALSE) |>
+  filter(TRAVDAY != "01",
+          TRAVDAY != "07")
+
+trip_data <- here("data",
+                    "NHTS",
+                    "trippub.csv") |>
+  read_csv(show_col_types = FALSE)  |>
+  filter(TRAVDAY != "01",
+          TRAVDAY != "07") |>
+  select(HOUSEID,
+         PERSONID,
+         TDTRPNUM,
+         TRIPPURP,
+         WHYFROM,
+         WHYTO,
+         TRPTRANS, 
+         R_AGE,
+         EDUC,
+         WTTRDFIN)
+```
+
+### **Link up unlinked trips**
+
+```{r}
+trip_data |>
+  filter(HOUSEID == "40173222" & PERSONID == "03") |>
+  kable()
+```
+
+```{r}
+trip_data <- trip_data |>
+  mutate(transfer_trip = WHYTO == "07" | WHYFROM == "07")
+
+transfer_trips <- trip_data |>
+  filter(transfer_trip) |>
+  filter(WHYTO != WHYFROM) # remove trips that begin AND end with a transfer
+
+next_destination <- c(transfer_trips$WHYTO[2:nrow(transfer_trips)], "last")
+
+transfer_trips <- transfer_trips |>
+  mutate(next_destination = next_destination) |>
+  mutate(WHYTO = ifelse(WHYTO == "07", next_destination, WHYTO)) |>
+  filter(WHYFROM != "07") |>
+  select(-next_destination)
+
+trip_data <- trip_data |>
+  filter(!transfer_trip) |>
+  rbind(transfer_trips) |>
+  select(-TRIPPURP, -TRPTRANS, -transfer_trip)
+```
+
+```{r}
+trip_data |>
+  filter(HOUSEID == "40173222" & PERSONID == "03") |>
+  kable()
+```
+
+### **Construct trip purposes**
+
+```{r}
+home <- c("01", "02")
+work <- c("03", "04", "05")
+per_bus <- c("06", "11", "12", "14", "18")
+soc_rec <- c("10", "13", "15", "16", "17", "19")
+school <- c("08", "09")
+lt_hs_grad <- c("-1", "-7", "-8", "01")
+
+trip_data <- trip_data |>
+  mutate(purpose = case_when(WHYTO %in% home & WHYFROM %in% work ~ "HBW",
+                             WHYTO %in% work & WHYFROM %in% home ~ "HBW",
+                             WHYTO %in% work | WHYFROM %in% work ~ "NHBW",
+                             WHYTO %in% home & WHYFROM %in% per_bus ~ "HBPB",
+                             WHYTO %in% per_bus & WHYFROM %in% home ~ "HBPB",
+                             WHYTO %in% home & WHYFROM %in% soc_rec ~ "HBSR",
+                             WHYTO %in% soc_rec & WHYFROM %in% home ~ "HBSR",
+                             WHYTO %in% home &
+                               WHYFROM %in% school &
+                               EDUC %in% lt_hs_grad &
+                               R_AGE < 21 ~ "HBSC",
+                             WHYTO %in% school &
+                               WHYFROM %in% home &
+                               EDUC %in% lt_hs_grad &
+                               R_AGE < 21 ~ "HBSC",
+                             WHYTO %in% home &
+                               WHYFROM %in% school ~ "HBU",
+                             WHYTO %in% school &
+                               WHYFROM %in% home ~ "HBU",
+                             WHYTO %in% home | WHYFROM %in% home ~ "HBO",
+                             TRUE ~ "NHBNW"))
+```
+
+### **Summarize trip purposes**
+
+```{r}
+trip_data |>
+  group_by(purpose) |>
+  summarise(`Number of trips (unweighted)` = n()) |>
+  mutate(`Percent of trips (unweighted)` = 
+           100 * `Number of trips (unweighted)`/
+           sum(`Number of trips (unweighted)`)) |>
+  arrange(desc(`Percent of trips (unweighted)`)) |>
+  kable(format.args = list(big.mark = ","), digits = 0)
+```
+
+```{r}
+trip_data |>
+  as_survey_design(weights = WTTRDFIN) |>
+  group_by(purpose) |>
+  survey_tally() |>
+  mutate(`Percent of trips (weighted)` =  100*n / sum(n)) |>
+  rename(`Number of trips (weighted)` = n) |>
+  select(purpose, 
+         `Number of trips (weighted)`,
+         `Percent of trips (weighted)`) |>
+  arrange(desc(`Percent of trips (weighted)`)) |>
+  kable(format.args = list(big.mark = ","), digits = 0)
+```
+
+## **Select and construct predictor variables**
+
+```{r}
+n_kids <- person_data |>
+  mutate(is_age = R_AGE >= 5 & R_AGE <= 15) |>
+  group_by(HOUSEID) |>
+  summarise(n_kids = sum(is_age))
+
+hh_data <- hh_data |>
+  mutate(veh_avail = case_when(HHVEHCNT == 0 ~ "Zero",
+                               DRVRCNT > HHVEHCNT ~ "Insuff.",
+                               TRUE ~ "Suff.")) |>
+  mutate(HHFAMINC = as.numeric(HHFAMINC)) |>
+  filter(HHFAMINC > 0) |>
+  mutate(income = case_when(HHFAMINC < 4 ~ "low",
+                             HHFAMINC < 5 & HHSIZE > 1 ~ "low",
+                             HHFAMINC < 6 & HHSIZE > 3 ~ "low",
+                             HHFAMINC < 7 & HHSIZE > 5 ~ "low",
+                             HHFAMINC < 8 & HHSIZE > 7 ~ "low",
+                             HHFAMINC > 8 ~ "high",
+                            TRUE ~ "middle")) |>
+  mutate(income = factor(income, levels = c("low", "middle", "high"))) |>
+  left_join(n_kids) |>
+  select(HOUSEID,
+         HHSIZE,
+         WRKCOUNT,
+         n_kids,
+         veh_avail,
+         income)
+```
+
+```{r}
+kids <- person_data |>
+  filter(SCHTYP == "01") |>
+  select(HOUSEID, PERSONID, R_SEX, WKFTPT, R_RACE, R_AGE) |>
+  inner_join(hh_data)
+```
+
+```{r}
+tripelse <- trip_data |>
+  filter(purpose != "HBSC") |>
+  group_by(HOUSEID, PERSONID) |>
+  summarise(tripelse = n())
+
+kids <- kids |>
+  left_join(tripelse) |>
+  replace_na(list(tripelse = 0)) |>
+  mutate(income = factor(income, levels = c("low", "middle", "high")))
+```
+
+## **Data visualization**
+
+```{r}
+ggplot(kids) +
+  geom_histogram(aes(x = tripelse),
+                 binwidth = 1,
+                 color = "gray",
+                 fill = "lightgreen") +
+  scale_x_continuous(name = "Number of non-school trips",
+                     breaks = seq(0, 12, by=1)) +
+  scale_y_continuous(name = "Number of non-driving students in sample") +
+  theme_minimal()
+```
+
+```{r}
+kids |> 
+  mutate(tripelse = ifelse(is.na(tripelse), 0, tripelse)) |> 
+  summarise(
+    `Average count of non-HBSC trips` = mean(tripelse),
+    `Standard deviation` = sd(tripelse)
+  ) |> 
+  kable(digits = 3)
+
+```
+
+## **Estimate models**
+
+#### linear model
+
+```{r}
+tripelse_model_1 <- lm(tripelse ~ n_kids + veh_avail + income, 
+   data = kids)
+
+summary(tripelse_model_1)
+```
+
+```{r}
+tibble(Variable = c("(Intercept)",
+                    "n_kids",
+                    "vehavailSuff.",
+                    "vehavailZero",
+                    "incomemiddle",
+                    "incomehigh"),
+       `Linear model` = tripelse_model_1$coefficients,
+       `p-value` = summary(tripelse_model_1)$coefficients[,4],
+       `TDM23 rate` = c(1.414,
+                        -0.149,
+                        -0.025,
+                        0,
+                        -0.093,
+                        0.062)) |>
+  kable(digits = 3)
+
+```
+
+```{r}
+kids |>
+  summarise(`Minimum kid trips` = min(n_kids),
+            `Maximum kid trips` = max(n_kids)) |>
+  t() |>
+  kable()
+```
+
+```{r}
+kids |>
+  group_by(tripelse) |>
+  summarise(`n_kids` = n()) |>
+  mutate(`Percent of traveling kids` = 
+           100*`n_kids` / sum(`n_kids`)) |>
+  kable(digits = 0)
+```
+
+```{r}
+tripelse_check_1 <- tibble(observed = tripelse_model_1$model$tripelse,
+                    predicted = tripelse_model_1$fitted.values)
+
+ggplot(tripelse_check_1) +
+  geom_jitter(aes(x = observed,
+                 y = predicted),
+              color = "lightgreen",
+              alpha = 0.1) +
+  scale_x_continuous(name = "Number of observed trips per kid",
+                     limits = c(-1, 12.5),
+                     breaks = seq(0, 12, by = 1)) +
+  scale_y_continuous(name = "Number of predicted trips per kid",
+                     limits = c(0, 2),
+                     breaks = seq(0, 2, by = 0.25)) +
+  theme_minimal()
+
+
+names(tripelse_model_1)
+
+```
+
+```{r}
+tripelse_check_1 <- tripelse_check_1 |>
+  mutate(observed_cat = case_when(observed == 0 ~ "Zero",
+                                  observed == 1 ~ "One", 
+                                  observed == 2 ~ "Two",
+                                  TRUE ~ "Three_plus"),
+         predicted_cat = case_when(round(predicted) == 0 ~ "Zero",
+                                   round(predicted) == 1 ~ "One", 
+                                   round(predicted) == 2 ~ "Two",
+                                   TRUE ~ "Three_plus")) |>
+  mutate(observed_cat = factor(observed_cat,
+                               levels = c("Zero",
+                                          "One",
+                                          "Two",
+                                          "Three_plus")),
+         predicted_cat = factor(predicted_cat,
+                                levels = c("Zero",
+                                          "One",
+                                          "Two",
+                                          "Three_plus")))
+
+confusionMatrix(tripelse_check_1$predicted_cat, tripelse_check_1$observed_cat)
+```
+
+```{r}
+kids |>
+  summarise(mean_tripelse = mean(tripelse),
+            st_dev_tripelse = sd(tripelse)) |>
+  kable(digits = 3)
+```
+
+#### poisson
+
+```{r}
+tripelse_model_2 <- glm(tripelse ~ 
+                    n_kids + veh_avail + income, 
+   data = kids,
+   family = "poisson")
+
+summary(tripelse_model_2)
+```
+
+```{r}
+AIC(tripelse_model_1)
+```
+
+```{r}
+tripelse_check_2 <- tibble(observed = tripelse_model_2$model$tripelse,
+                    predicted = tripelse_model_2$fitted.values)
+
+ggplot(tripelse_check_2) +
+  geom_jitter(aes(x = observed,
+                 y = predicted),
+              color = "lightgreen",
+              alpha = 0.2,
+              size = 0.1) +
+  scale_x_continuous(name = "Number of observed trips per worker",
+                     limits = c(-1, 12.5),
+                     breaks = seq(0, 12, by = 1)) +
+  scale_y_continuous(name = "Number of predicted trips per worker",
+                     limits = c(0, 2),
+                     breaks = seq(0, 2, by = 0.25)) +
+  theme_minimal()
+```
+
+```{r}
+tripelse_check_2 <- tripelse_check_2 |>
+  mutate(observed_cat = case_when(observed == 0 ~ "Zero",
+                                  observed == 1 ~ "One", 
+                                  observed == 2 ~ "Two",
+                                  TRUE ~ "Three_plus"),
+         predicted_cat = case_when(round(predicted) == 0 ~ "Zero",
+                                   round(predicted) == 1 ~ "One", 
+                                   round(predicted) == 2 ~ "Two",
+                                   TRUE ~ "Three_plus")) |>
+  mutate(observed_cat = factor(observed_cat,
+                               levels = c("Zero",
+                                          "One",
+                                          "Two",
+                                          "Three_plus")),
+         predicted_cat = factor(predicted_cat,
+                                levels = c("Zero",
+                                          "One",
+                                          "Two",
+                                          "Three_plus")))
+
+confusionMatrix(tripelse_check_2$predicted_cat, tripelse_check_1$observed_cat)
+```
+
+#### **zero inflated poisson**
+
+```{r}
+tripelse_model_3 <- zeroinfl(tripelse ~ 
+                          n_kids +
+                            veh_avail +
+                            income,     
+                        data = kids,    
+                        dist = "poisson")  
+
+summary(tripelse_model_3)
+```
+
+```{r}
+AIC(tripelse_model_3)
+```
+
+```{r}
+hbw_check_3 <- tibble(observed = hbw_model_3$model$hbw_trips, 
+                      predicted = hbw_model_3$fitted.values)
+
+ggplot(hbw_check_3) +   
+  geom_jitter(aes(x = observed,                  
+                  y = predicted),               
+              color = "lightgreen",               
+              alpha = 0.1,               
+              size = 0.1) +   
+  scale_x_continuous(name = "Number of observed trips per worker",
+                     limits = c(-1, 12.5),
+                     breaks = seq(0, 12, by = 1)) +   
+  scale_y_continuous(name = "Number of predicted trips per worker",
+                     limits = c(0, 2),
+                     breaks = seq(0, 2, by = 0.25)) +
+  theme_minimal()
+```
+
+```{r}
+# Example output from the summary
+count_model_coefficients <- tripelse_model_3$coefficients$count
+zero_inflation_coefficients <- tripelse_model_3$coefficients$zero
+tibble(
+  Variable = c("(Intercept)", "n_kids", "veh_avail", "income"),  # Adjust based on your model
+  `ZIP model` = c(count_model_coefficients, zero_inflation_coefficients),
+  `p-value` = c(summary(tripelse_model_3)$coefficients$count[, 4], 
+                summary(tripelse_model_3)$coefficients$zero[, 4]),
+  `TDM23 rate` = c(1.414, -0.149, -0.025, 0)  # Adjust based on your comparison
+) |> 
+  kable(digits = 3)
+
+```
+
+```{r}
+length(tripelse_model_3$coefficients)
+
+```
+
+```{r}
+hbw_check_3 <- hbw_check_3 |>
+  mutate(observed_cat = case_when(observed == 0 ~ "Zero",
+                                  observed == 1 ~ "One",
+                                  observed == 2 ~ "Two",
+                                  TRUE ~ "Three_plus"),
+         predicted_cat = case_when(round(predicted) == 0 ~ "Zero",
+                                   round(predicted) == 1 ~ "One",
+                                   round(predicted) == 2 ~ "Two",
+                                   TRUE ~ "Three_plus")) |>
+  mutate(observed_cat = factor(observed_cat,
+                               levels = c("Zero",
+                                          "One",
+                                          "Two",
+                                          "Three_plus")),
+         predicted_cat = factor(predicted_cat,
+                                levels = c("Zero",
+                                           "One",
+                                           "Two",
+                                           "Three_plus")))
+
+confusionMatrix(hbw_check_3$predicted_cat, hbw_check_3$observed_cat)
+```
