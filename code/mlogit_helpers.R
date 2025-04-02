@@ -9,6 +9,8 @@ freq_cat <- function(x) {
   uniqx[which.max(tabulate(match(x, uniqx)))]
 }
 
+'%!in%' <- function(x,y)!('%in%'(x,y))
+
 ## A function to create a dfidx object from an individual-level 
 ## dataset (no alternative-level variables)
 fn_make_dfidx <- function(my_situation, 
@@ -16,6 +18,60 @@ fn_make_dfidx <- function(my_situation,
                           my_alts) {
   
   options <- base::unique(my_situation[[my_alts]])
+  
+  base::colnames(my_situation)[colnames(my_situation) == my_alts] ="alternatives"
+  base::colnames(my_situation)[colnames(my_situation) == my_id] ="id"
+  
+  rep_trips <- my_situation |>
+    dplyr::mutate(avail_choice = options[1]) 
+  
+  for (i in 2:length(options)){
+    next_trips <- my_situation |>
+      dplyr::mutate(avail_choice = options[i])
+    rep_trips = dplyr::bind_rows(rep_trips, next_trips)
+  }
+  
+  rep_trips <- rep_trips |>
+    dplyr::arrange(id) |>
+    dplyr::mutate(choice = ifelse(alternatives == avail_choice, TRUE, FALSE)) |> 
+    dplyr::relocate(choice) |>
+    dplyr::relocate(avail_choice) |>
+    dplyr::relocate(id) |>
+    dplyr::select(-alternatives) 
+  
+  dfidx <- dfidx::dfidx(rep_trips, drop.index = FALSE)
+}
+
+# inputs is an od matrix and a skim
+fn_make_dfidx_destination <- function(my_od_mat, 
+                                      my_o_id,
+                                      my_d_id,
+                                      my_cost,
+                                      my_flow,
+                                      my_sample_size) {
+  
+  base::colnames(my_od_mat)[colnames(my_od_mat) == my_o_id] ="o_id"
+  base::colnames(my_od_mat)[colnames(my_od_mat) == my_d_id] ="d_id"
+  base::colnames(my_od_mat)[colnames(my_od_mat) == my_cost] ="cost"
+  base::colnames(my_od_mat)[colnames(my_od_mat) == my_flow] ="flow"
+  
+  origins <- unique(my_od_mat$o_id)
+  destinations <- unique(my_od_mat$d_id)
+   
+  ### First step in loop.
+  taken_options <- my_od_mat |>
+    dplyr::filter(o_id == origins[1])
+  
+  if (nrow(taken_options) < my_sample_size) {
+    untaken_destinations <- destinations[destinations %!in% taken_options$d_id]
+    
+    untaken_options <- tibble(o_id = origins[1],
+                              d_id = sample(untaken_destinations, 
+                                            size = my_sample_size - 
+                                              nrow(taken_options),
+                                            replace = FALSE))
+                              
+  }
   
   base::colnames(my_situation)[colnames(my_situation) == my_alts] ="alternatives"
   base::colnames(my_situation)[colnames(my_situation) == my_id] ="id"

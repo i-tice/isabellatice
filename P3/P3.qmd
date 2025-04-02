@@ -507,16 +507,32 @@ The standard deviation is less than the mean, so a Poisson model would be fine. 
 ```{r}
 
 hbw_model_2 <- glm(hbw_trips ~ 
-                     n_seniors + 
-                     WRKCOUNT + 
-                     veh_avail + 
-                     income + 
-                     female + 
-                     part_time, 
+                   n_seniors + 
+                   WRKCOUNT + 
+                   veh_avail + 
+                   income + 
+                   female + 
+                   part_time, 
    data = workers,
    family = "poisson")
 
 summary(hbw_model_2)
+```
+
+As an aside, if you wanted to use a negative binomial model instead of a Poisson model, you would do it like this:
+
+```{r}
+
+hbw_model_2nb <- MASS::glm.nb(hbw_trips ~ 
+                        n_seniors + 
+                       WRKCOUNT + 
+                        veh_avail + 
+                        income + 
+                        female + 
+                        part_time, 
+   data = workers)
+
+summary(hbw_model_2nb)
 ```
 
 You'll notice that this model doesn't report an R-square value, but it does report an Akaike Information Criterion value (AIC), which is an alternative measure of model fit. We can compare this to the linear model (lower values are better).
@@ -653,11 +669,35 @@ hbw_model_3 <- zeroinfl(hbw_trips ~
 summary(hbw_model_3)
 ```
 
-### 
+As an aside, if you wanted this to be a zero-inflated negative-binomial regression instead of a zero-inflated Poisson regression, you would just change `dist = "poisson"` to `dist = "negbin"`:
+
+```{r}
+hbw_model_3nb <- zeroinfl(hbw_trips ~ 
+                          n_seniors + 
+                          WRKCOUNT +                          
+                          veh_avail +                          
+                          income +                          
+                          female +                          
+                          part_time |                         
+                          n_seniors +                          
+                          WRKCOUNT +                          
+                          veh_avail +                          
+                          income +                          
+                          female +                          
+                          part_time,     
+                        data = workers,    
+                        dist = "negbin")  
+
+summary(hbw_model_3nb)
+
+```
+
+But going back to the results of the zero-inflated Poisson model, let's check the fit.
 
 ```{r}
 
 AIC(hbw_model_3)
+
 ```
 
 The AIC score is a little bit better than the Poisson model or the linear model.

@@ -42,7 +42,7 @@ This is assuming you're using the same alternative scenario that you used for th
 
 -   Select the scenario you want to run (the options should be "Base" and the other scenario that you've previously modified in the `*.scenarios` file).
 
--   Right-click on and of the model steps ans select "Run \>", then "Run Range of Steps". Hold down the Shift or Ctrl key whie selecting "Work From Home" and "Trip Generation." You don't need to rerun the Initialization and Vehicle Availability steps because you still have the outputs from those steps saved.
+-   Right-click on and of the model steps and select "Run \>", then "Run Range of Steps". Hold down the Shift or Ctrl key while selecting "Work From Home" and "Trip Generation." You don't need to rerun the Initialization and Vehicle Availability steps because you still have the outputs from those steps saved.
 
 -   Then go get a snack or go for a walk to look at birds or squirrels or something. On my computer, this part of the model run takes ten or fifteen minutes.
 
@@ -74,6 +74,7 @@ Now we can see a list of the tables that are available in that database.
 ```{r}
 base_tables <- dbListTables(base_db)
 
+base_tables
 ```
 
 The results of the trip generation step will be in the `trip_prod` (trip productions), `trip_attr` (trip attractions), and `prod_nhb` (productions - non-home-based).
@@ -193,10 +194,10 @@ head(alt_block_prod) |>
 
 ```
 
-Now we can join those two tables and compare them. There are a lot of blocks that register tiny differences, so I'll define a difference as more than half a trip as a meaningful change (you can choose a different tolerance if you like). I'm also going to focus on home-based trips for the moment, since I'll be placing them on a map and the locations of non-home-based trip productions aren't based on the trip-maker's residence.
+Now we can join those two tables and compare them. There are a lot of blocks that register tiny differences, so I'll define a difference as more than two trips a meaningful change (you can choose a different tolerance if you like). I'm also going to focus on home-based trips for the moment, since I'll be placing them on a map and the locations of non-home-based trip productions aren't based on the trip-maker's residence.
 
 ```{r}
-tolerance <- 0.5
+tolerance <- 2
 
 compare_prod <- full_join(base_block_prod, alt_block_prod) |>
   mutate(dif_hbw_p = hbw_p_alt - hbw_p,
@@ -234,13 +235,17 @@ zones <- rbind(ma_blocks, TAZs)
 dif_blocks_prod <- zones |>
   right_join(compare_prod) 
 
-hb_prod_labels <- paste0(formatC(dif_blocks_prod$dif_hbw_p, format = "f", digits = 2),
+hb_prod_labels <- paste0(formatC(dif_blocks_prod$dif_hbw_p, 
+                                 format = "f", digits = 2),
                         " change in HBW trips<br/>",
-                        formatC(dif_blocks_prod$dif_hbsc_p, format = "f", digits = 2), 
+                        formatC(dif_blocks_prod$dif_hbsc_p, 
+                                format = "f", digits = 2), 
                         " change in HB-school trips<br/>",
-                        formatC(dif_blocks_prod$dif_hbsr_p, format = "f", digits = 2),
+                        formatC(dif_blocks_prod$dif_hbsr_p, 
+                                format = "f", digits = 2),
                         " change in HB-soc/rec trips<br/>",
-                        formatC(dif_blocks_prod$dif_hbpb_p, format = "f", digits = 2),
+                        formatC(dif_blocks_prod$dif_hbpb_p, 
+                                format = "f", digits = 2),
                          " change in HB-per-bus") |>
   lapply(htmltools::HTML)
 
@@ -292,7 +297,7 @@ You can see the number of trips attracted to each block for each of the six trip
 
 Now let's compare this to the alternative scenario
 
-```{r}
+```{r, message=FALSE}
 
 alt_db <- dbConnect(drv=RSQLite::SQLite(), 
                      dbname=here("model",
@@ -334,23 +339,32 @@ Only four blocks had a change in the number of trip attractions. This is because
 dif_blocks_attr <- zones |>
   right_join(compare_attr) 
 
-attr_labels <- paste0(formatC(dif_blocks_attr$diff_hbw_inc1_a, format = "f", digits = 2),
+attr_labels <- paste0(formatC(dif_blocks_attr$diff_hbw_inc1_a, 
+                              format = "f", digits = 2),
                         " change in HBW trips (< $35k)<br/>",
-                      formatC(dif_blocks_attr$diff_hbw_inc2_a, format = "f", digits = 2),
+                      formatC(dif_blocks_attr$diff_hbw_inc2_a, 
+                              format = "f", digits = 2),
                         " change in HBW trips ($35k - $65k)<br/>",
-                      formatC(dif_blocks_attr$diff_hbw_inc3_a, format = "f", digits = 2),
+                      formatC(dif_blocks_attr$diff_hbw_inc3_a, 
+                              format = "f", digits = 2),
                         " change in HBW trips ($65k - $100k)<br/>",
-                      formatC(dif_blocks_attr$diff_hbw_inc4_a, format = "f", digits = 2),
+                      formatC(dif_blocks_attr$diff_hbw_inc4_a, 
+                              format = "f", digits = 2),
                         " change in HBW trips (> $100k)<br/>",
-                        formatC(dif_blocks_attr$diff_hbsc_a, format = "f", digits = 2), 
+                        formatC(dif_blocks_attr$diff_hbsc_a, 
+                                format = "f", digits = 2), 
                         " change in HB-school trips<br/>",
-                        formatC(dif_blocks_attr$diff_hbsr_a, format = "f", digits = 2),
+                        formatC(dif_blocks_attr$diff_hbsr_a, 
+                                format = "f", digits = 2),
                         " change in HB-soc/rec trips<br/>",
-                        formatC(dif_blocks_attr$diff_hbpb_a, format = "f", digits = 2),
+                        formatC(dif_blocks_attr$diff_hbpb_a, 
+                                format = "f", digits = 2),
                          " change in HB-per-bus<br/>",
-                      formatC(dif_blocks_attr$diff_nhbw_a, format = "f", digits = 2),
+                      formatC(dif_blocks_attr$diff_nhbw_a, 
+                              format = "f", digits = 2),
                         " non-home-based work trips<br/>",
-                      formatC(dif_blocks_attr$diff_nhbnw_a, format = "f", digits = 2),
+                      formatC(dif_blocks_attr$diff_nhbnw_a, 
+                              format = "f", digits = 2),
                         " change in non-home-based non-work trips") |>
   lapply(htmltools::HTML)
 
@@ -416,9 +430,11 @@ Difference in non-home-based trips productions much more spread out across 138 z
 dif_blocks_nhb <- zones |>
   right_join(compare_nhb) 
 
-nhb_labels <- paste0(formatC(dif_blocks_nhb$diff_nhbw_p, format = "f", digits = 2),
+nhb_labels <- paste0(formatC(dif_blocks_nhb$diff_nhbw_p, 
+                             format = "f", digits = 2),
                         " non-home-based work trips<br/>",
-                      formatC(dif_blocks_nhb$diff_nhbnw_p, format = "f", digits = 2),
+                      formatC(dif_blocks_nhb$diff_nhbnw_p, 
+                              format = "f", digits = 2),
                         " change in non-home-based non-work trips") |>
   lapply(htmltools::HTML)
 
