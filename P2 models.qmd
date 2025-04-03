@@ -1,0 +1,376 @@
+---
+title: "P2Izzy"
+format: html
+editor: visual
+---
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+1 + 1
+```
+
+## Load libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse) 
+library(here) 
+library(mlogit) 
+library(knitr) 
+library(caret)
+```
+
+```{r}
+here("code",      
+         "mlogit_helpers.R") |>   
+  source()
+```
+
+```{r}
+'%!in%' <- function(x,y)!('%in%'(x,y))
+```
+
+## Load dataset
+
+```{r}
+hh_data <- here("data",                 
+                    "NHTS",                 
+                    "hhpub.csv") |>   
+  read_csv(show_col_types = FALSE)
+```
+
+```{r}
+person_data <- here("data",                     
+                    "NHTS",                     
+                    "perpub.csv") |>   
+  read_csv(show_col_types = FALSE)
+```
+
+## Constructing variables
+
+```{r}
+hh_data <- hh_data |>
+  select(WRKCOUNT,
+         DRVRCNT,
+         HHVEHCNT,
+         HHSIZE,
+         NUMADLT,
+         HHFAMINC,
+         HBPPOPDN,
+         HOUSEID,
+         BIKE,
+         HBHUR)
+```
+
+```{r}
+person_data <- person_data |>
+  select(HOUSEID,
+         R_AGE,
+         WORKER,
+         DRIVER)
+```
+
+### Outcome: Vehicle availability
+
+```{r}
+hh_data <- hh_data |>
+  mutate(veh_avail = case_when(HHVEHCNT == 0 ~ "Zero",
+                               DRVRCNT > HHVEHCNT ~ "Insuff.",
+                               TRUE ~ "Suff."))
+```
+
+### Predictor: Number of Children
+
+```{r}
+hh_data <- hh_data |>
+  mutate(n_child = HHSIZE - NUMADLT)
+```
+
+### Predictor: Number of seniors
+
+```{r, message=FALSE}
+n_seniors <- person_data |>
+  mutate(is_senior = R_AGE > 64) |>
+  group_by(HOUSEID) |>
+  summarise(n_seniors = sum(is_senior))
+
+hh_data <- hh_data |>
+  left_join(n_seniors)
+```
+
+### Predictor: Presence of third driver
+
+```{r}
+hh_data <- hh_data |>
+  mutate(three_drivers = DRVRCNT > 2)
+```
+
+### Predictor: Number of drivers beyond two
+
+```{r}
+hh_data <- hh_data |>
+  mutate(n_extra_drivers = ifelse(three_drivers, DRVRCNT - 2, 0))
+```
+
+### Predictor: Income
+
+Low-income designation depends on both income and household size. All households with income more than \$125,000 are designated as high income.
+
+```{r}
+hh_data <- hh_data |>
+  mutate(HHFAMINC = as.numeric(HHFAMINC)) |>
+  filter(HHFAMINC > 0) |>
+  mutate(income = case_when(HHFAMINC < 4 ~ "low",
+                             HHFAMINC < 5 & HHSIZE > 1 ~ "low",
+                             HHFAMINC < 6 & HHSIZE > 3 ~ "low",
+                             HHFAMINC < 7 & HHSIZE > 5 ~ "low",
+                             HHFAMINC < 8 & HHSIZE > 7 ~ "low",
+                             HHFAMINC > 8 ~ "high",
+                            TRUE ~ "medium")) |>
+    mutate(income = factor(income, levels = c("medium", "low", "high")))     
+```
+
+### Predictor: Non-worker driver
+
+```{r}
+non_work_driver <- person_data |>
+  mutate(non_work_driver = WORKER == "02" & DRIVER == "01") |>
+  group_by(HOUSEID) |>
+  summarise(non_work_driver = max(non_work_driver))
+
+hh_data <- hh_data |>
+  left_join(non_work_driver)
+```
+
+### Predictor: categorical Density
+
+```{r}
+hh_data <- hh_data |>
+  filter(HBPPOPDN > 0) |>
+  mutate(catdensity = case_when(HBPPOPDN < 7000 ~ "Low",
+                             HBPPOPDN < 10000 ~ "High",
+                             TRUE ~ "Medium"))
+```
+
+### New Predictor: continuous Density
+
+```{r}
+hh_data <- hh_data |>
+  filter(HBPPOPDN > 0) |>
+  mutate(contdensity = log(HBPPOPDN))
+```
+
+### New Predictor: Bike use
+
+```{r}
+hh_data <- hh_data |> 
+  mutate(BIKE = as.numeric(BIKE))
+
+```
+
+```{r}
+hh_data <- hh_data |>   
+  filter(BIKE > 0) |>   
+  mutate(bike = case_when(BIKE == 01 ~ "Often",                           
+                          BIKE == 02 ~ "Often",
+                          BIKE == 03 ~ "Sometimes",
+                          BIKE == 04 ~ "Sometimes",
+                          BIKE == 05 ~ "Never",
+                             TRUE ~ "unknown"))
+```
+
+### New Predictor: Urban/Rural indicator block group
+
+|       |                 |
+|-------|-----------------|
+| **C** | **Second City** |
+| **R** | **Rural**       |
+| **S** | **Suburban**    |
+| **T** | **Small Town**  |
+| **U** | **Urban**       |
+
+```{r}
+hh_data <- hh_data |> 
+  mutate(urban = case_when(HBHUR == "C" ~ 1,   #Second City
+                           HBHUR == "R" ~ 2,   # Rural
+                           HBHUR == "S" ~ 3,   # Suburban
+                           HBHUR == "T" ~ 4,   # Small Town
+                           HBHUR == "U" ~ 5,   # Urban
+                           TRUE ~ NA_real_ ))
+
+```
+
+## Prepare data
+
+```{r}
+hh_data <- hh_data |>
+  select(HOUSEID,
+         veh_avail,
+         WRKCOUNT,
+         n_child,
+         n_seniors,
+         n_extra_drivers,
+         three_drivers,
+         non_work_driver,
+         income,
+         catdensity,
+         contdensity,
+         bike,
+         urban)
+```
+
+### Create training and test databases
+
+```{r}
+set.seed(5594043)
+
+hh_data_train_ids <- sample(hh_data$HOUSEID, 
+                        size = ceiling(nrow(hh_data)/2))
+
+hh_data_train <- hh_data |>
+  filter(HOUSEID %in% hh_data_train_ids)
+
+hh_data_test <- hh_data |>
+  filter(HOUSEID %!in% hh_data_train_ids)
+```
+
+### Create dfidx data
+
+```{r}
+veh_dfidx_train <- fn_make_dfidx(hh_data_train,
+                                "HOUSEID",
+                                "veh_avail")
+
+veh_dfidx_test <- fn_make_dfidx(hh_data_test,
+                                "HOUSEID",
+                                "veh_avail")
+```
+
+## Estimate original model
+
+```{r}
+model_veh1 <- mlogit(choice ~ 0 | 
+                      WRKCOUNT +
+                      n_child +
+                      n_seniors +
+                      n_extra_drivers +
+                      three_drivers + 
+                      non_work_driver +
+                      income +
+                      catdensity | 0,
+                           veh_dfidx_train,
+                           reflevel = "Suff.")
+```
+
+```{r}
+summary(model_veh1)
+```
+
+### Interpreting original model results
+
+```{r, message=FALSE}
+predicts_test1 <- predict(model_veh1, veh_dfidx_test) |>
+  as.data.frame() |>
+  rownames_to_column("HOUSEID") |>
+  mutate(HOUSEID = as.numeric(HOUSEID)) |>
+  left_join(hh_data_test)
+```
+
+```{r}
+head(predicts_test1) |>
+  kable()
+```
+
+### Checking original model reliability and accuracy
+
+```{r}
+predicts_test1 <- predicts_test1 |>
+  mutate(most_likely = case_when((Suff. > Insuff.) & (Suff. > Zero) ~ "Suff.",
+                                 (Zero > Insuff.) & (Zero > Suff.) ~ "Zero",
+                                 TRUE ~ "Insuff.")) 
+```
+
+```{r}
+predicts_test1 <- predicts_test1 |>
+  mutate(most_likely = factor(most_likely, 
+                              levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(veh_avail = factor(veh_avail,
+                            levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(correct = veh_avail == most_likely)
+
+
+```
+
+```{r}
+confusionMatrix(data = predicts_test1$most_likely,
+                reference = predicts_test1$veh_avail)
+```
+
+## Estimate New Model
+
+```{r}
+model_veh2 <- mlogit(choice ~ 0 | 
+                      WRKCOUNT +
+                      n_child +
+                      n_seniors +
+                      n_extra_drivers +
+                      three_drivers + 
+                      non_work_driver +
+                      income +
+                      contdensity +
+                      bike +
+                      urban | 0,
+                           veh_dfidx_train,
+                           reflevel = "Suff.")
+```
+
+### Interpreting new model results
+
+```{r, message=FALSE}
+predicts_test2 <- predict(model_veh2, veh_dfidx_test) |>
+  as.data.frame() |>
+  rownames_to_column("HOUSEID") |>
+  mutate(HOUSEID = as.numeric(HOUSEID)) |>
+  left_join(hh_data_test)
+```
+
+```{r}
+head(predicts_test2) |>
+  kable()
+```
+
+### Checking new model reliability and accuracy
+
+```{r}
+predicts_test2 <- predicts_test2 |>
+  mutate(most_likely = case_when((Suff. > Insuff.) & (Suff. > Zero) ~ "Suff.",
+                                 (Zero > Insuff.) & (Zero > Suff.) ~ "Zero",
+                                 TRUE ~ "Insuff.")) 
+```
+
+```{r}
+predicts_test2 <- predicts_test2 |>
+  mutate(most_likely = factor(most_likely, 
+                              levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(veh_avail = factor(veh_avail,
+                            levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(correct = veh_avail == most_likely)
+
+
+```
+
+```{r}
+confusionMatrix(data = predicts_test2$most_likely,
+                reference = predicts_test2$veh_avail)
+```
+
+```{r}
+summary(model_veh2)
+```
+
+```{r}
+AIC(model_veh1)
+
+AIC(model_veh2)
+
+```

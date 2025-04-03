@@ -57,4 +57,9 @@ data/NHTS/vehpub.csv
 # All model input and output
 model/outputs/
 model/inputs/
+inputs - Copy/
 
+model/ui/
+
+# large intermediate data files from P4
+P4/data/

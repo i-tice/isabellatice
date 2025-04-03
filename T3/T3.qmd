@@ -1,0 +1,950 @@
+---
+title: "T3: Trip distribution"
+format: 
+  html:
+    theme: minty
+    toc: true
+    toc-location: left
+editor: visual
+---
+
+The purpose of this assignment is for you to
+
+-   Familiarize your self with the inputs to the Boston Region Metropolitan Planning Organization's regional travel demand model ([TDM23](https://www.ctps.org/travel-demand-model)),
+
+-   Run the trip distribution step of TDM23 for both the existing (2019) condition and an alternative you've developed (it could be the same one you used for T1 and/or T2, or a new one), and
+
+-   Identify changes in trip distribution that result from your alternative scenario.
+
+## Load libraries
+
+This analysis uses the following packages:
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(DBI)
+library(here)
+library(leaflet)
+library(maptiles)
+library(tidyterra)
+library(knitr)
+library(tigris)
+library(omxr)
+library(scales)
+library(cowplot)
+library(RColorBrewer)
+library(chorddiag)
+library(units)
+
+sf::sf_use_s2(FALSE)
+```
+
+You'll need to install the omxr package and the chorddiag package by running the following lines from your console (you may also need to install the `devtools` package first.
+
+```         
+devtools::install_github("gregmacfarlane/omxr")
+devtools::install_github("mattflor/chorddiag")
+```
+
+## Run the trip generation model for each scenario
+
+This is assuming you're using the same alternative scenario that you used for prior assignments.
+
+-   Open the model file in TransCAD.
+
+-   Select the scenario you want to run (the options should be "Base" and the other scenario that you've previously modified in the `*.scenarios` file).
+
+-   Right-click on and of the model steps and select "Run \>", then "Run Range of Steps". Hold down the Shift or Ctrl key while selecting "Work From Home" and "Trip Generation." You don't need to rerun the Initialization and Vehicle Availability steps because you still have the outputs from those steps saved.
+
+-   Then go get a snack or go for a walk to look at birds or squirrels or something. On my computer, this part of the model run takes ten or fifteen minutes.
+
+-   Do this for both the base scenario and the alternative scenario you've created.
+
+```{r}
+
+here("T3",
+     "gifs",
+     "run-steps.gif") |>
+  knitr::include_graphics()
+```
+
+## Export trip matrices to .omx files
+
+The TDM23 model saves the production-attraction matrices as \*.mtx files, which I haven't had luck importing into R, so you should export them as \*.omx files and open them using Greg Macfarlane's `omxr` package.
+
+The trip matrix for the folder will be in a file called pa_all_all.mtx, which you can find in your model outputs folder:
+
+-   outputs
+
+    -   (scenario name)
+
+        -   \_demand
+
+            -   td
+
+                -   pa_all_all.mtx
+
+There are other matrix files that have disaggregated trip totals by peak and off-peak time periods and by trip purpose. Feel free to use those in your comparison, but in this example, I'm just using the daily totals across all trip purposes.
+
+To export the \*.mtx file as a \*.omx file:
+
+1.  Open the matrix file in TransCAD
+
+2.  Select "Export" then "Table..." from the "File" menu.
+
+3.  Set the file type as "OMX Matrix", select a filename, and click "Save."
+
+4.  You only need to keep the hb and nhb matrices, so select those and click "OK".
+
+```{r, echo=FALSE}
+
+here("T3",
+     "gifs",
+     "convert-omx.gif") |>
+  knitr::include_graphics()
+```
+
+Do this for both your base scenario and your alternative scenario.
+
+## Load trip matrices in R
+
+You can can read the files you just exported into R. Here is how you can load the trip matrix for the base scenario and view the first few rows.
+
+```{r, message=FALSE}
+
+base_pa <- here("model",
+             "outputs",
+             "Base",
+             "_demand",
+             "td",
+             "pa_trips_all_all.omx") |>
+  read_all_omx(c("hb", "nhb")) |>
+  mutate(total_hh_trips = hb + nhb)
+
+head(base_pa) |>
+  kable(digits = 2)
+
+```
+
+We've imported it as a dataframe with the following columns:
+
+-   **origin:** The TAZ ID of the trip productions (they're using origin/destination terms here, but these are still productions/attractions at this point in the model workflow).
+
+-   **destination:** The TAZ ID of the trip attractions
+
+-   **hb:** The number of home-based trips.
+
+-   **nhb:** The number of non-home-based trips
+
+-   **total_hh_trips:** We've just calculated this as the number of home-based trips plus the number of non-home-based trips.
+
+And we can also load the production-attraction matrix for the alternative scenario.
+
+```{r, message=FALSE}
+
+alt_pa <- here("model",
+             "outputs",
+             "Alternative",
+             "_demand",
+             "td",
+             "pa_trips_all_all.omx") |>
+  read_all_omx(c("hb", "nhb"))|>
+  mutate(total_hh_trips = hb + nhb)
+
+head(alt_pa) |>
+  kable(digits = 2)
+```
+
+## Visualization
+
+To start visualizing the demand for travel between origin-destination pairs, we need to associate the TAZ IDs for origins and destinations with their locations. As a reminder, here is a map of the TAZs in our model.
+
+```{r}
+
+TAZs <- here("model",
+             "inputs",
+             "zonal",
+             "shp",
+             "CTPS_TDM23_TAZ_2017g_v202303.shp") |>
+  st_read(quiet = TRUE) |>
+  st_transform("WGS84")
+
+leaflet(TAZs) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addPolygons(weight = 2,
+              color = "orange",
+              fillColor = "orange",
+              fillOpacity = 0.1,
+              highlightOptions = highlightOptions(weight = 3,
+                                                  fillOpacity = 0.5),
+              label = TAZs$taz_id)
+```
+
+There in an inconsistency in the way the TAZs are numbered between the TAZ shapefile and the origin-destination matrices for Berkshire County, Frankline County, Rhode Island, and New Hampshire, so for this assignment, we're going to remove those areas (both from the TAZ map and from the production-attraction data).
+
+```{r}
+
+TAZs <- TAZs |>
+  filter(state == "MA",
+         mpo != "BRPC",
+         mpo != "FRCOG")
+
+base_pa <- base_pa |>
+  filter(origin %in% TAZs$taz_id,
+         destination %in% TAZs$taz_id)
+
+alt_pa <- alt_pa |>
+  filter(origin %in% TAZs$taz_id,
+         destination %in% TAZs$taz_id)
+
+leaflet(TAZs) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addPolygons(weight = 2,
+              color = "orange",
+              fillColor = "orange",
+              fillOpacity = 0.1,
+              highlightOptions = highlightOptions(weight = 3,
+                                                  fillOpacity = 0.5),
+              label = TAZs$taz_id)
+```
+
+### Intrazonal trips
+
+The easiest (least complicated) flows to visualize are intrazonal trips (trips that begin and end in the same zone. We can just make a couple chloropleth maps showing the number of intrazonal trips within each zone and the percentage of all trips from each zone that are intrazonal.
+
+I'll use the baseline scenario as an example. Here's how I would set up the data set for those maps.
+
+```{r, message=FALSE}
+
+base_productions <- base_pa |>
+  group_by(origin) |>
+  summarize(productions = sum(total_hh_trips)) |>
+  rename(taz_id = origin)
+
+base_attractions <- base_pa |>
+  group_by(destination) |>
+  summarize(attractions = sum(total_hh_trips)) |>
+  rename(taz_id = destination)
+
+base_intrazonal <- base_pa |>
+  filter(origin == destination) |>
+  select(origin, total_hh_trips) |>
+  rename(taz_id = origin,
+         intrazonal = total_hh_trips) |>
+  full_join(base_productions) |>
+  full_join(base_attractions) |>
+  filter(productions + attractions > 0) |>
+  mutate(pct_intra_attr = intrazonal / attractions,
+         pct_intra_prod = intrazonal / productions) 
+
+base_intrazonal <- TAZs |>
+  inner_join(base_intrazonal)
+
+base_map <- get_tiles(base_intrazonal,
+                      provider = "CartoDB.Positron",
+                      zoom = 8,
+                      crop = TRUE)
+
+
+```
+
+Here's a map of where the intrazonal trips are.
+
+```{r}
+
+ggplot(base_intrazonal) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(color = NA,
+          alpha = 0.7,
+          aes(fill = intrazonal)) +
+  scale_fill_viridis_c(transform = "log",
+                       breaks = breaks <- 10^seq(-3, 4, by=1),
+                       labels = c(formatC(breaks[1:3], 
+                                        format = "f",
+                                        digits = 3),
+                                  formatC(breaks[4:8],
+                                          format = "d",
+                                        big.mark = " ")),
+                       name = "Number of\nintrazonal trips") +
+  theme_void()
+```
+
+Here's a map of the percentage of all productions that are for intrazonal trips.
+
+```{r}
+
+ggplot(base_intrazonal) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(color = NA,
+          alpha = 0.7,
+          aes(fill = pct_intra_prod)) +
+  scale_fill_viridis_c(name = "Intrazonal trips\n(% of productions)",
+                       breaks = breaks <- seq(0, 0.7, by=0.1),
+                       labels = paste0(round(breaks*100),"%")) +
+  theme_void()
+```
+
+And here's a map of the percentage of all attractions that are for intrazonal trips.
+
+```{r}
+
+ggplot(base_intrazonal) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(color = NA,
+          alpha = 0.7,
+          aes(fill = pct_intra_attr)) +
+  scale_fill_viridis_c(name = "Intrazonal trips\n(% of attractions)",
+                       breaks = breaks <- seq(0, 0.9, by=0.1),
+                       labels = paste0(round(breaks*100),"%")) +
+  theme_void()
+```
+
+### Desire lines
+
+For interzonal trips, one way to visualize origin-destination flows is through *desire lines* on a map. A desire line is a straight line from a trip's origin (or production) to its destination (or attraction). We can use the zone centroids as the endpoints on those desire lines.
+
+```{r, warning=FALSE}
+
+TAZ_pts <- st_centroid(TAZs)
+
+leaflet(TAZ_pts) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addCircleMarkers(weight = 2,
+             color = NA,
+             fillColor = "orange",
+             radius = 3,
+             fillOpacity = 0.6,
+             label = TAZ_pts$taz_id)
+```
+
+Here's a function that will create a set of desire lines from a origin-destination (or production-attraction) matrix and a set of points defining the locations of zone centroids.
+
+```{r}
+
+make_desire_lines <- function(od_df,
+                              points,
+                              origin_column,
+                              destination_column,
+                              trips_column,
+                              taz_id_column) {
+  
+  od_df <- od_df |>
+    ungroup() |>
+    rename(origin = all_of(origin_column),
+           destination = all_of(destination_column),
+           trips = all_of(trips_column)) |>
+    select(origin, destination, trips) |>
+    filter(origin != destination)
+  
+  points <- points |>
+    rename(taz_id = all_of(taz_id_column))
+  
+  desire_line_data <- od_df |>
+    mutate(id = seq(1, nrow(od_df))) |>
+    pivot_longer(cols = c(origin, destination),
+                 names_to = "o_d",
+                 values_to = "taz_id") 
+
+  desire_lines <- points |>
+    right_join(desire_line_data) |>
+    group_by(id) |>
+    summarize(trips = mean(trips),
+              origin_taz = first(taz_id),
+              destin_taz = last(taz_id)) |>
+    ungroup() |>
+    select(origin_taz, destin_taz, trips) |>
+    st_cast("LINESTRING")
+  
+  desire_lines
+
+}
+```
+
+Generating a set of desire lines for all zones within the entire study area (18.4 million line segments) would take forever, and it would also be pretty useless to plot (just an illegible pile of lines). But we could do it for just a small number of zones in the vicinity of where I made my changes.
+
+Here is how I can identify the TAZ centroids that are within one mile of TAZ 595 (the focus of where I made changes for my alternative scenario). Notice that before I create the buffer, I'm transforming the points layer into the Massachusetts State Plane coordinate system (EPSG: 2249), which is based on feet, and then I transform the points back to WGS 84 (latitude/longitude coordinates) to be able to plot the with Leaflet. Also note that there are 5280 feet in one mile.
+
+```{r, message=FALSE}
+
+focus_area <- TAZ_pts[TAZ_pts$taz_id == 595,] |>
+  st_transform(2249) |>
+  st_buffer(dist = 5280)
+
+focus_area_pts <- TAZ_pts |>
+  st_transform(2249) |>
+  st_filter(focus_area) |>
+  st_transform("WGS84")
+
+leaflet(focus_area_pts) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addCircleMarkers(weight = 2,
+             color = NA,
+             fillColor = "orange",
+             radius = 5,
+             fillOpacity = 0.6,
+             label = focus_area_pts$taz_id)
+
+
+```
+
+Now I can filter my PA matrices to just include trips within that smaller set of points, and create desire lines.
+
+```{r, message=FALSE}
+
+focus_area_base_pa <- base_pa |>
+  filter(origin %in% focus_area_pts$taz_id,
+         destination %in% focus_area_pts$taz_id)
+
+desire_lines_base_focus <- make_desire_lines(od_df = focus_area_base_pa,
+                                             points = focus_area_pts,
+                                             origin_column = "origin",
+                                             destination_column = "destination",
+                                             trips_column = "total_hh_trips",
+                                             taz_id_column = "taz_id")
+
+base_map <- get_tiles(desire_lines_base_focus,
+                      provider = "CartoDB.Positron",
+                      zoom = 14,
+                      crop = TRUE)
+
+ggplot(desire_lines_base_focus) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(aes(linewidth = trips),
+          alpha = 0.1,
+          color = "coral") +
+  theme_void()
+
+```
+
+If you want to get a legible set of desire lines for a wider area, you could try aggregating your trips into larger zones.
+
+For example, we could aggregate into towns. There are 293 towns in the study area, and 97 of those are in the Boston region.
+
+```{r, message=FALSE, warning=FALSE}
+
+boston_town_pts <- TAZ_pts |>
+  filter(mpo == "BRMPO") |>
+  group_by(town) |>
+  summarise(n_zones = n()) |>
+  st_centroid()
+
+TAZ_town_codes <- st_drop_geometry(TAZ_pts) |>
+  filter(mpo == "BRMPO") |>
+  select(taz_id, town) 
+
+base_pa_towns <- base_pa |>
+  rename(taz_id = origin) |>
+  left_join(TAZ_town_codes) |>
+  rename(origin_town = town,
+         origin = taz_id) |>
+  rename(taz_id = destination) |>
+  left_join(TAZ_town_codes) |>
+  rename(destin_town = town,
+         destination = taz_id) |>
+  group_by(origin_town, destin_town) |>
+  summarize(trips = sum(total_hh_trips)) |>
+  filter(!is.na(origin_town),
+         !is.na(destin_town))
+```
+
+And we can create a map of desire lines between towns.
+
+```{r, message=FALSE, warning=FALSE}
+
+desire_lines_base_towns <- make_desire_lines(od_df = base_pa_towns,
+                                             points = boston_town_pts,
+                                             origin_column = "origin_town",
+                                             destination_column = "destin_town",
+                                             trips_column = "trips",
+                                             taz_id_column = "town")
+
+base_map <- get_tiles(desire_lines_base_towns,
+                      provider = "CartoDB.Positron",
+                      zoom = 10,
+                      crop = TRUE)
+
+ggplot(desire_lines_base_towns) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(aes(linewidth = trips),
+          alpha = 0.01,
+          color = "coral") +
+  theme_void()
+
+```
+
+That's still not terribly legible. We could try limiting our visualization to a smaller number of towns.
+
+```{r}
+
+fewer_towns <- c("CAMBRIDGE",
+                            "BOSTON",
+                            "SOMERVILLE",
+                            "MEDFORD",
+                            "EVERETT",
+                            "MALDEN")
+
+base_fewer_pa_towns <- base_pa_towns |>
+  filter(origin_town %in% fewer_towns,
+         destin_town %in% fewer_towns)
+
+desire_fewer_base_towns <- make_desire_lines(od_df = base_fewer_pa_towns,
+                                             points = boston_town_pts,
+                                             origin_column = "origin_town",
+                                             destination_column = "destin_town",
+                                             trips_column = "trips",
+                                             taz_id_column = "town")
+
+base_map <- get_tiles(desire_fewer_base_towns,
+                      provider = "CartoDB.Positron",
+                      zoom = 13,
+                      crop = TRUE)
+
+ggplot(desire_fewer_base_towns) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(aes(linewidth = trips),
+          alpha = 0.5,
+          color = "coral") +
+  theme_void()
+
+```
+
+Or we could aggregate to larger areas. The TDM23 study area is divided into 13 MPOS:
+
+1.  Boston Region Metropolitan Planning Organization (BRMPO)
+
+2.  Berkshire Regional Planning Council (BRPC)
+
+3.  Cape Cod Commission (CCC)
+
+4.  Central Massachusetts Regional Planning Council (CMRPC)
+
+5.  Franklin Regional Council of Governments (FRCOG)
+
+6.  Montachusett Regional Planning Council (MRPC)
+
+7.  Martha's Vineyard Commission (MVC\_
+
+8.  Merrimack Valley Planning Commission (MVPC)
+
+9.  NMCOG = Northern Middlesex Council of Governments (NMCOG)
+
+10. Nantucket Planning & Economic Development Commission (NPEDC)
+
+11. Old Colony Planning Council (OCPC)
+
+12. Pioneer Valley Planning Council (PVPC)
+
+13. Southeastern Regional Planning & Economic Development District (SRPEDD)
+
+As I've mentions, something is up with the TAZ numbers for BRPC and FRCOG, but we can aggregate our zones to the other eleven.
+
+```{r, message=FALSE, warning=FALSE}
+mpo_pts <- TAZ_pts |>
+  group_by(mpo) |>
+  summarise(n_zones = n()) |>
+  st_centroid()
+
+TAZ_mpo_codes <- st_drop_geometry(TAZ_pts) |>
+  select(taz_id, mpo) 
+
+base_pa_mpos <- base_pa |>
+  rename(taz_id = origin) |>
+  left_join(TAZ_mpo_codes) |>
+  rename(origin_mpo = mpo,
+         origin = taz_id) |>
+  rename(taz_id = destination) |>
+  left_join(TAZ_mpo_codes) |>
+  rename(destin_mpo = mpo,
+         destination = taz_id) |>
+  group_by(origin_mpo, destin_mpo) |>
+  summarize(trips = sum(total_hh_trips)) |>
+  filter(!is.na(origin_mpo),
+         !is.na(destin_mpo))
+```
+
+And now we can generate desire lines among those MPOs.
+
+```{r, message=FALSE, warning=FALSE}
+
+desire_base_mpos <- make_desire_lines(od_df = base_pa_mpos,
+                                      points = mpo_pts,
+                                      origin_column = "origin_mpo",
+                                      destination_column = "destin_mpo",
+                                      trips_column = "trips",
+                                      taz_id_column = "mpo")
+
+base_map <- get_tiles(desire_base_mpos,
+                      provider = "CartoDB.Positron",
+                      zoom = 8,
+                      crop = TRUE)
+
+ggplot(desire_base_mpos) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(aes(linewidth = trips),
+          alpha = 0.5,
+          color = "coral") +
+  theme_void()
+```
+
+### Chord diagrams
+
+We can also use a chord diagram to visualize origin-destination (or production-attraction) flows without a map.
+
+```{r}
+
+mat <- matrix(base_fewer_pa_towns$trips, 
+              nrow = 6, 
+              ncol = 6, 
+              byrow = TRUE) 
+
+chorddiag(mat, groupNames = base_fewer_pa_towns$destin_town[1:6])
+
+
+```
+
+## Compare scenarios
+
+Now we can join those two data frames to identify differences. Note that I'm setting a tolerance of ten trips, meaning I'll recognize a change as having happened for a pair of zones if the number of trips between them has changed by at least ten trips.
+
+```{r, message=FALSE}
+
+tolerance <- 10
+
+base_pa <- base_pa |>
+  mutate(total_hh_trips_base = hb + nhb) |>
+  select(origin, destination, total_hh_trips_base)
+
+alt_pa <- alt_pa |>
+  mutate(total_hh_trips_alt = hb + nhb) |>
+  select(origin, destination, total_hh_trips_alt)
+
+comparison <- inner_join(base_pa, alt_pa) |>
+  mutate(difference = total_hh_trips_alt - total_hh_trips_base) |>
+  filter(abs(difference) > tolerance)
+
+head(comparison) |>
+  kable(digits = 1)
+```
+
+### Impacted locations
+
+Where are those TAZs located?
+
+```{r, message=FALSE}
+
+changed_TAZ_list <- unique(c(comparison$origin, comparison$destination))
+
+lost_p <- comparison |>
+  filter(difference < 0) |>
+  group_by(origin) |>
+  summarise(lost_p = -1 * sum(difference)) |>
+  rename(taz_id = origin)
+
+lost_a <- comparison |>
+  filter(difference < 0) |>
+  group_by(destination) |>
+  summarise(lost_a = -1 * sum(difference)) |>
+  rename(taz_id = destination)
+
+gain_p <- comparison |>
+  filter(difference > 0) |>
+  group_by(origin) |>
+  summarise(gain_p = sum(difference)) |>
+  rename(taz_id = origin)
+
+gain_a <- comparison |>
+  filter(difference > 0) |>
+  group_by(destination) |>
+  summarise(gain_a = sum(difference)) |>
+  rename(taz_id = destination)
+
+comparison_summary <- full_join(gain_a,
+                                gain_p) |>
+  full_join(lost_a) |>
+  full_join(lost_p) |>
+  replace_na(list(lost_a = 0,
+                  lost_p = 0, 
+                  gain_a = 0,
+                  gain_p = 0))
+
+changed_TAZs <- TAZs |>
+  right_join(comparison_summary)
+
+change_labels <- paste0("Gained ",
+                        round(changed_TAZs$gain_a),
+                        " trips to here<br/>",
+                        "Lost ",
+                        round(changed_TAZs$lost_a),
+                        " trips to here<br/>",
+                        "Gained ",
+                        round(changed_TAZs$gain_p),
+                        " trips from here<br/>",
+                        "Lost ",
+                        round(changed_TAZs$lost_p),
+                        " trips from here<br/>") |>
+  lapply(htmltools::HTML)
+
+leaflet(changed_TAZs) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addPolygons(weight = 2,
+              color = "orange",
+              fillColor = "orange",
+              fillOpacity = 0.1,
+              highlightOptions = highlightOptions(weight = 3,
+                                                  fillOpacity = 0.5),
+              label = change_labels)
+
+```
+
+You can explore that interactive map and see that some of the biggest changes are around the Fellsway bridge, which makes sense, since I removed that bridge in my alternative scenario.
+
+### Comparison visualization
+
+We can experiment with a couple of approaches to visualizing how travel patterns would be expected to change under the alternative scenario.
+
+Let's start by separating changes in intrazonal trips (where the production and attraction are in the same zone) from changes in interzonal trips (where the production and attraction are in two different zones).
+
+```{r}
+
+intrazonal_trips <- comparison |>
+  filter(origin == destination) |>
+  rename(taz_id = origin) |>
+  select(-destination)
+
+interzonal_trips <- comparison |>
+  filter(origin != destination) 
+```
+
+#### Intrazonal trips
+
+We might start by looking at the distribution of changes in intrazonal trips.
+
+```{r}
+
+ggplot(intrazonal_trips) +
+  geom_histogram(aes(x = difference),
+                 binwidth = 10,
+                 fill = "orange",
+                 alpha = 0.5,
+                 color = "gray") +
+  scale_y_continuous(breaks = seq(0, 12, by=1),
+                     name = "Number of zones (among zones with\na differnce of at least +/- 10 trips)") +
+  scale_x_continuous(breaks = seq(0, 600, by = 50),
+                     name = "Difference in number of intrazonal trips") +
+  theme_minimal()
+  
+```
+
+We can see that no zones had a reduction in intrazonal trips. Of the 21 zones where there was an increase, most of those increases were relatively small (less than 20). Two outliers are one zone with an increase of about 180 intrazonal trips and one with an increase of about 600 intrazonal trips.
+
+Let's look at the spatial distribution of those changes.
+
+```{r, message=FALSE}
+
+intrazonal_locs <- changed_TAZs |>
+  right_join(intrazonal_trips)
+
+base_map <- get_tiles(intrazonal_locs,
+                      provider = "CartoDB.Positron",
+                      zoom = 13,
+                      crop = TRUE)
+
+ggplot(intrazonal_locs) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(color = "gray",
+          alpha = 0.7,
+          aes(fill = difference)) +
+  scale_fill_viridis_c(transform = "log",
+                       breaks = c(10*2^seq(1, 6, by=1)),
+                       direction = -1,
+                       name = "Increase in\nintrazonal\ntrips") +
+  theme_void()
+```
+
+#### Desire lines
+
+*Desire lines* are straight lines between origins and destinations, and they can be a useful way to visualize (changes in) the demand for intrazonal travel.
+
+```{r, warning=FALSE, message=FALSE}
+
+changed_TAZ_points <- changed_TAZs |>
+  st_centroid() |>
+  select(taz_id)
+
+desire_line_data <- interzonal_trips |>
+  mutate(id = seq(1, nrow(interzonal_trips))) |>
+  pivot_longer(cols = c(origin, destination),
+               names_to = "o_d",
+               values_to = "taz_id") 
+
+desire_line_change <- changed_TAZ_points |>
+  right_join(desire_line_data) |>
+  group_by(id) |>
+  summarize(difference = mean(difference),
+            origin_taz = first(taz_id),
+            destin_taz = last(taz_id)) |>
+  ungroup() |>
+  select(difference, origin_taz, destin_taz) |>
+  st_cast("LINESTRING")
+
+base_map <- get_tiles(desire_line_change,
+                      provider = "CartoDB.DarkMatter",
+                      zoom = 12,
+                      crop = TRUE)
+
+ggplot(desire_line_change) + 
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(aes(color = difference)) +
+  scale_color_gradient2(low = muted("red"), 
+                        mid = "white",
+                        high = muted("blue"),
+                        midpoint = 0) +
+  theme_void()
+```
+
+In the above map, it's hard to see much of what's going on, other than that most of the differences are relatively low.
+
+We could try:
+
+-   Separating gains and losses into different layers, showing gains in blue and losses in red
+
+-   Using line thickness to indicate the magnitude of the change
+
+-   Increasing the transparency of the lines
+
+```{r}
+
+desire_line_gain <- desire_line_change |>
+  filter(difference > 0)
+
+desire_line_loss <- desire_line_change |>
+  filter(difference < 0) |>
+  mutate(difference = -1 * difference)
+
+base_map <- get_tiles(desire_line_change,
+                      provider = "CartoDB.Positron",
+                      zoom = 12,
+                      crop = TRUE)
+
+ggplot() + 
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(data = desire_line_loss,
+          alpha = 0.2,
+          aes(linewidth = difference,
+              color = "Reduced demand")) +
+  geom_sf(data = desire_line_gain,
+          alpha = 0.2,
+          aes(linewidth = difference,
+              color = "Increased demand")) +
+  scale_linewidth(name = "Magnitude of difference\n(number of trips)") +
+  scale_color_manual(name = "Direction of difference",
+                     values = c(muted("blue"), muted("red"))) +
+  guides(color = guide_legend(override.aes = list(linewidth = 2,
+                                                  alpha = 0.5))) +
+  theme_void()
+```
+
+That's a little better. What if we showed the gains and losses on separate maps?
+
+```{r}
+
+gain_map <- ggplot() + 
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(data = desire_line_gain,
+          alpha = 0.15,
+          color = "orange",
+          aes(linewidth = difference)) +
+  scale_linewidth(name = "Magnitude of difference",
+                  limits = c(0,500),
+                  breaks = breaks <- seq(100, 500, by = 100),
+                  labels = paste0(breaks, " trips")) +
+  theme_void() 
+
+loss_map <- ggplot() + 
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(data = desire_line_loss,
+          alpha = 0.15,
+          color = "orange",
+          aes(linewidth = difference)) +
+  scale_linewidth(name = "Magnitude of difference",
+                  limits = c(0,500),
+                  breaks = breaks <- seq(100, 500, by = 100),
+                  labels = paste0(breaks, " trips")) +
+  theme_void() 
+
+legend <- get_legend(loss_map)
+
+plot_grid(gain_map + theme(legend.position = "none"), 
+          loss_map + theme(legend.position = "none"), 
+          legend,
+          nrow = 1,
+          labels = c("Trip increases",
+                     "Trip decreases",
+                     ""),
+          label_size = 10,
+          label_y = 0.8,
+          label_x = -0.12)
+```
+
+It could also be helpful to focus on a few locations with the biggest changes. What might those be?
+
+```{r}
+most_gained_a <- comparison_summary$taz_id[
+  comparison_summary$gain_a == max(comparison_summary$gain_a)]
+
+most_gained_p <- comparison_summary$taz_id[
+  comparison_summary$gain_p == max(comparison_summary$gain_p)]
+
+most_lost_a <- comparison_summary$taz_id[
+  comparison_summary$lost_a == max(comparison_summary$lost_a)]
+
+most_lost_p <- comparison_summary$taz_id[
+  comparison_summary$lost_p == max(comparison_summary$lost_p)]
+
+tibble(Change = c("Greatest production gain",
+                  "Greatest attraction gain",
+                  "Greatest production loss",
+                  "Greatest attraction loss"),
+       TAZ = c(most_gained_p,
+               most_gained_a,
+               most_lost_p,
+               most_lost_a),
+       Magnitude = c(max(comparison_summary$gain_p),
+                     max(comparison_summary$gain_a),
+                     max(comparison_summary$lost_p),
+                     max(comparison_summary$lost_a))) |>
+  kable(digits = 1)
+```
+
+It looks like all the greatest changes are associated with TAZ 594. So let's take a closer look at which location have more or fewer trips coming to or from that zone.
+
+```{r, message=FALSE}
+
+compare_taz_594 <- comparison |>
+  filter(origin == 594 | destination == 594) |>
+  mutate(taz_id = ifelse(origin == 594, destination, origin)) |>
+  group_by(taz_id) |>
+  summarise(difference = sum(difference)) 
+
+taz_594_zones <- changed_TAZs |>
+  right_join(compare_taz_594) |>
+  select(difference)
+
+base_map <- get_tiles(taz_594_zones,
+                      provider = "CartoDB.Positron",
+                      zoom = 12,
+                      crop = TRUE)
+
+ggplot(taz_594_zones) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(color = "gray",
+          aes(fill = difference)) +
+  scale_fill_gradient2(low = muted("red"),
+                       mid = "white",
+                       high = muted("blue"),
+                       midpoint = 0) +
+  theme_void()
+```
+
+TAZ 594 is the one with the darkest blue color on the above map (this is Assembly Row). What we see there is that many trips between Assembly Row and the commercial area immediately across the river (Station Landing) have been replaced by intrazonal trips within Assembly Row. In general, we see that with the loss of the Fellsway bridge, the lost trips from Medford, Everett, and Malden are replaced by an increase in trips from Somerville (particularly from within Assembly Row).

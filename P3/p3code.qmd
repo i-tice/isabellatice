@@ -322,10 +322,7 @@ confusionMatrix(tripelse_check_1$predicted_cat, tripelse_check_1$observed_cat)
 ```
 
 ```{r}
-kids |>
-  summarise(mean_tripelse = mean(tripelse),
-            st_dev_tripelse = sd(tripelse)) |>
-  kable(digits = 3)
+AIC(tripelse_model_1)
 ```
 
 #### poisson
@@ -340,7 +337,7 @@ summary(tripelse_model_2)
 ```
 
 ```{r}
-AIC(tripelse_model_1)
+AIC(tripelse_model_2)
 ```
 
 ```{r}
@@ -404,10 +401,10 @@ AIC(tripelse_model_3)
 ```
 
 ```{r}
-hbw_check_3 <- tibble(observed = hbw_model_3$model$hbw_trips, 
-                      predicted = hbw_model_3$fitted.values)
+tripelse_check_3 <- tibble(observed = tripelse_model_3$model$tripelse, 
+                      predicted = tripelse_model_3$fitted.values)
 
-ggplot(hbw_check_3) +   
+ggplot(tripelse_check_3) +   
   geom_jitter(aes(x = observed,                  
                   y = predicted),               
               color = "lightgreen",               
@@ -423,27 +420,7 @@ ggplot(hbw_check_3) +
 ```
 
 ```{r}
-# Example output from the summary
-count_model_coefficients <- tripelse_model_3$coefficients$count
-zero_inflation_coefficients <- tripelse_model_3$coefficients$zero
-tibble(
-  Variable = c("(Intercept)", "n_kids", "veh_avail", "income"),  # Adjust based on your model
-  `ZIP model` = c(count_model_coefficients, zero_inflation_coefficients),
-  `p-value` = c(summary(tripelse_model_3)$coefficients$count[, 4], 
-                summary(tripelse_model_3)$coefficients$zero[, 4]),
-  `TDM23 rate` = c(1.414, -0.149, -0.025, 0)  # Adjust based on your comparison
-) |> 
-  kable(digits = 3)
-
-```
-
-```{r}
-length(tripelse_model_3$coefficients)
-
-```
-
-```{r}
-hbw_check_3 <- hbw_check_3 |>
+tripelse_check_3 <- tripelse_check_3 |>
   mutate(observed_cat = case_when(observed == 0 ~ "Zero",
                                   observed == 1 ~ "One",
                                   observed == 2 ~ "Two",
@@ -463,5 +440,5 @@ hbw_check_3 <- hbw_check_3 |>
                                            "Two",
                                            "Three_plus")))
 
-confusionMatrix(hbw_check_3$predicted_cat, hbw_check_3$observed_cat)
+confusionMatrix(tripelse_check_3$predicted_cat, tripelse_check_3$observed_cat)
 ```
