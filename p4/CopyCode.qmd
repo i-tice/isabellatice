@@ -1,0 +1,978 @@
+---
+title: "P4: Trip Distribution"
+format: 
+  html:
+    theme: minty
+    toc: true
+    toc-location: left
+editor: visual
+---
+
+## Load libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+options(java.parameters = '-Xmx4G')
+
+library(tidyverse)
+library(here)
+library(knitr)
+library(tigris)
+library(stringr)
+library(maptiles)
+library(tidyterra)
+library(r5r)
+library(sf)
+library(leaflet)
+
+here("code",
+     "grvty_balancing.R") |>
+  source()
+```
+
+## Select a study area
+
+```{r count-cbsas, message=FALSE}
+
+all_cbsas <- st_read("C:/Users/izzyt/OneDrive/Desktop/isabellatice/p4/shapefiles/tl_2024_us_cbsa.shp") |>
+  select(NAMELSAD) |>
+  mutate(type = ifelse(str_detect(NAMELSAD, "Metro"), "Metro", "Micro")) |>
+  mutate(type = as.character(type))
+
+table(all_cbsas$type) |>
+  kable()
+
+```
+
+```{r lima-boundary}
+lima <- all_cbsas |>
+  filter(NAMELSAD == "Lima, OH Metro Area") |>
+  st_transform("WGS84")
+
+base_map <- get_tiles(lima,
+                      provider = "CartoDB.Positron",
+                      zoom = 9,
+                      crop = TRUE)
+
+ggplot(lima) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(fill = NA,
+          color = "orange") +
+  theme_void()
+
+```
+
+## Load Job Data
+
+LEHD Origin-Destination Employment Statistics (<https://lehd.ces.census.gov/data/#lodes>) includes the number of workers who live/work between any pair of census blocks in a given state in a given year.
+
+You can download data on all workers who live and work in a particular state and load it directly into R using the `read_csv()` function and the appropriate url for the state and year you want data for.
+
+Since county IDs are contained within block IDs, you can create a variable indicating which county each block is in and filter the data to include only those workers who live and work within the study area.
+
+```{r read-jobs, message=FALSE}
+state <- "oh"
+year <- "2021"
+
+lima_counties_5_digit <- c("39003")
+lima_counties_3_digit <- substr(lima_counties_5_digit, 3, 5)
+
+url <- paste0("https://lehd.ces.census.gov/data/lodes/LODES8/",
+              state,
+              "/od/",
+              state,
+              "_od_main_JT00_",
+              year,
+              ".csv.gz")
+
+pa_data <- read_csv(url) |>
+  mutate(w_county = substr(w_geocode, 1, 5),
+         h_county = substr(h_geocode, 1, 5)) |>
+  filter(h_county %in% lima_counties_5_digit &
+           w_county %in% lima_counties_5_digit) |>
+  mutate(w_geocode = as.character(w_geocode),
+         h_geocode = as.character(h_geocode))
+  
+```
+
+```{r view-jobs}
+
+head(pa_data) |>
+  kable()
+```
+
+I can see that we have the following columns:
+
+-   **w_geocode:** This is the 15-digit FIPS code for one census block.
+
+-   **h_geocode:** This is the 15-digit FIPS code for another census block.
+
+-   **S000:** This is the **total** number of jobs held by workers who live in *h_goecode* and work in *w_geocode*.
+
+-   **SA01:** This is the total number of jobs held by workers **younger than 30** who live in *h_goecode* and work in *w_geocode*.
+
+-   **SA02:** This is the total number of jobs held by workers **between 30 and 54** who live in *h_goecode* and work in *w_geocode*.
+
+-   **SA03:** This is the total number of jobs held by workers **older than 54** who live in *h_goecode* and work in *w_geocode*.
+
+-   **SE01:** This is the total number of jobs held by workers **earning less than \$1251 per month** who live in *h_goecode* and work in *w_geocode*.
+
+-   **SE02:** This is the total number of jobs held by workers **earning \$1251 - \$3333 per** **month** who live in *h_goecode* and work in *w_geocode*.
+
+-   **SE03:** This is the total number of jobs held by workers **earning more than \$3333 per** **month** who live in *h_goecode* and work in *w_geocode*.
+
+-   **SI01:** This is the total number of jobs held by workers **in goods-producing sectors**[^1] who live in *h_goecode* and work in *w_geocode*.
+
+-   **SI02:** This is the total number of jobs held by workers **in trade, transportation, and utilities sectors**[^2] who live in *h_goecode* and work in *w_geocode*.
+
+-   **SI03:** This is the total number of jobs held by workers **in all other service sectors** who live in *h_goecode* and work in *w_geocode*.
+
+[^1]: NAICS codes 11 (agriculture, forestry, fishing, hunting), 21 (mining and extraction), 23 (construction), and 31-33 (manufacturing)
+
+[^2]: NAICS codes 22 (utilities), 42 (wholesale trade), 44-45 (retail trade), and 48-49 (transportation and warehousing)
+
+## Aggregate data to zone totals
+
+We have a dataset that shows, for workers who live in a particular zone, what share of those workers will go to work in each of the other zones.
+
+At the end of a trip generation model, we would have the number of trips produce by each zone and attracted to each zone, and the next step would be to distribute the trips produced in each zone among all those zones it might be attracted to. Let's use the jobs data we have to create a dataset in the form that we might have at the end of a trip generation step.
+
+In this example, I'm going to do a separate trip distribution matrix for workers in each of three industry categories, as well as a matrix for all jobs combined into a single category.
+
+```{r aggreg-jobs, message=FALSE}
+total_prod <- pa_data |>
+  group_by(h_geocode) |>
+  summarise(goods_p = sum(SI01),
+            trade_p = sum(SI02),
+            serve_p = sum(SI03),
+            total_p = sum(S000)) |>
+  rename(geocode = h_geocode)
+
+total_attr <- pa_data |>
+  group_by(w_geocode) |>
+  summarize(goods_a = sum(SI01),
+            trade_a = sum(SI02),
+            serve_a = sum(SI03),
+            total_a = sum(S000)) |>
+  rename(geocode = w_geocode)
+
+trip_gen <- full_join(total_prod,
+                      total_attr) |>
+  replace_na(list(goods_p = 0, 
+                  goods_a = 0,
+                  trade_p = 0,
+                  trade_a = 0,
+                  serve_p = 0,
+                  serve_a = 0,
+                  total_p = 0,
+                  total_a = 0))
+
+head(trip_gen) |>
+  kable()
+```
+
+## Load spatial data
+
+The idea behind the gravity model is that trips are more attracted to places with more attractions, and less attracted to places that are further away (in terms of travel time). So we need to associate all these jobs with their locations.
+
+First, let's download the census block boundaries within these four counties.
+
+```{r load-blocks, message=FALSE}
+
+msa_blocks <- st_read("C:/Users/izzyt/Documents/isabellatice/p4/shapefiles/blocks/tl_2020_39_tabblock20.shp")
+
+msa_blocks <- msa_blocks %>%
+  filter(COUNTYFP20 %in% lima_counties_3_digit)
+
+ggplot(msa_blocks) +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(fill = NA,
+          color = "orange") +
+  theme_void()
+```
+
+There are 6100 census blocks in the the Traverse City metropolitan area. We only have trip generation data for 4079 census blocks, so we know that many of those don't have any jobs or workers in them (for instance, some of them are mostly water).
+
+We'll join the trip generation table to these blocks, and filter them to only include those that are included in the trip generation table (i.e. we'll do a right join).
+
+```{r view-job-blocks, message=FALSE}
+trip_gen_locs <- msa_blocks |>
+  rename(geocode = GEOID20) |>
+  right_join(trip_gen) |>
+  select(geocode, 
+         goods_p, 
+         trade_p, 
+         serve_p,
+         total_p,
+         goods_a, 
+         trade_a,
+         serve_a,
+         total_a) |>
+  st_transform("WGS84")
+
+leaflet(trip_gen_locs) |>
+  addProviderTiles(provider = "CartoDB.Positron") |>
+  addPolygons(weight = 2,
+              color = "orange",
+              fillColor = "orange",
+              fillOpacity = 0.1,
+              highlightOptions = highlightOptions(weight = 3,
+                                                  fillOpacity = 0.5),
+              label = trip_gen_locs$geocode)
+```
+
+## Load the network
+
+Now let's load the street network. We'll use the OpenStreetMap network, which we can download from BBBike.
+
+-   Navigate your browser to <https://extract.bbbike.org/>
+
+-   Specify PBF as the file format, enter a name for your data extract, and enter your email address.
+
+-   Move the map to the area you want a network for and click the "here" button to define the area.
+
+-   Once you've defined the area, click the extract button.
+
+-   In a few minutes you'll receive an email with a download link.
+
+-   Create a folder called something like "network" in your project folder.
+
+-   Download the pbf file and save it to the folder you created.
+
+The r5r package uses the pbf file directly, but if you want to take a look at what's in it, you can export it to two spatial data layers: one for points (these are mostly intersections), and one for lines (these are mostly street segments). Here's how you might save those as shapefiles.
+
+```{r, eval=FALSE}
+
+lima_core <- here("P4",
+     "network") |>
+  setup_r5()
+
+street_vis <- street_network_to_sf(lima_core)
+
+street_lines <- street_vis$edges
+street_pts <- street_vis$vertices
+
+st_write(street_lines,
+         here("P4",
+              "data",
+              "street-lines.shp"))
+
+st_write(street_pts,
+         here("P4",
+              "data",
+              "street-pts.shp"))
+
+stop_r5()
+```
+
+I'm going to load them from those files. You don't necessarily need to, this is just to save time when rendering the tutorial page.
+
+```{r load-sf-roads, message=FALSE, results='hide'}
+street_lines <- here("P4",
+                     "data",
+                     "street-lines.shp") |>
+  st_read()
+
+street_pts <- here("P4",
+                     "data",
+                     "street-pts.shp") |>
+  st_read()
+
+
+```
+
+I will go ahead and plot these just to make sure I've captured the full extent of my study area with the street network.
+
+```{r}
+base_map <- get_tiles(street_lines,
+                      provider = "CartoDB.Positron",
+                      zoom = 8,
+                      crop = TRUE)
+
+ggplot() +
+  geom_spatraster_rgb(data = base_map) +
+  geom_sf(data = trip_gen_locs,
+          color = "palegreen3",
+          fill = "palegreen") +
+  geom_sf(data = street_lines,
+          color =  "salmon") +
+  theme_void()
+```
+
+And I can see that my street network does cover the full area of the trip generation zones (and a good bit beyond that).
+
+## Skim the network
+
+Now I need to calculate the travel time (by car) from every census block to every other block. Before I can do that, I need to represent the block locations as points rather than as polygons. A sensible approach would be to use zone centroids. The centroid of an irregularly-shaped zone (one with holes in it, or with some amount of concavity) might be located outside the zone. To avoid that, we'll use the function `st_point_on_surface`, which is like the `st_centroid` function, but it forces the point to be inside the polygon.
+
+To be extra, extra sure that the points we create can access the network, we'll snap them to the nearest point that's on the network. First we'll find the index of the nearest network point to each zone "centroid."
+
+```{r get-centroids, message=FALSE, warning=FALSE}
+
+trip_gen_loc_ids <- trip_gen_locs |>
+  st_point_on_surface() |>
+  st_nearest_feature(street_pts)
+```
+
+Then we'll take those nearest network points as our zone locations.
+
+```{r snap-centroids}
+
+trip_gen_pts <- street_pts[trip_gen_loc_ids,] |>
+  mutate(id = trip_gen_locs$geocode) |>
+  select(id)
+```
+
+Now we can calculate our travel time matrix.
+
+Note that calculating the travel time matrix (also called skimming the network) can take a little while - mostly depending on how many blocks you have in your study area. In this example, I have 4078 blocks, and it takes about half an hour. If you choose a smaller CBSA with fewer census blocks, it won't take as long. If you choose a large CBSA like Los Angeles, New York, or Chicago, it could take multiple days.
+
+Also note that r5r will generate a lot (a *lot*) or error and warning messages that you safely ignore.
+
+```{r, eval=FALSE}
+
+lima_core <- here("P4",
+     "network") |>
+  setup_r5()
+
+skim <- travel_time_matrix(lima_core,
+                           origins = trip_gen_pts,
+                           destinations = trip_gen_pts,
+                           mode = "CAR",
+                           max_trip_duration = 180)
+
+stop_r5()
+
+```
+
+The skim takes a long time to generate, so let's save it to the file to keep from having to re-do it every time we test our code.
+
+```{r, eval=FALSE}
+write_csv(skim, file = here("P4",
+                            "data",
+                            "lima-skim.csv"))
+```
+
+And now we can just work from the saved version. `col_types = "ccn"` is how I specify that the data I'm reading in has three columns: two character columns ("c" and "c"), followed by a numeric column ("n").
+
+```{r read-skim}
+skim <- read_csv(here("P4",
+                      "data",
+                      "lima-skim.csv"),
+                 col_types = "ccn")
+```
+
+Let's take a look at the first few rows of our skim data frame.
+
+```{r view-skim}
+
+head(skim) |>   
+  kable()
+```
+
+The data set has three columns to indicate the estimated travel time between every possible pair of blocks. Since the study area includes 4078 blocks, the total number of production-attraction pairs should be $4078^2$, which is 16,630,084 pairs.
+
+```{r count-skim}
+
+nrow(skim)
+```
+
+And that's exactly what we have. If you have fewer rows in your skim than the square of the number of zones, that means that there were some pairs for which the `r5r` package couldn't find a path through the network. There are three likely reasons for this:
+
+1.  One of more of your points is too far from the network. This could happen if, you have a large block with no internal roads, and the point representing the block is in the middle, far from any road. In a travel demand model, you would handle this by adding centroid connectors to your network. For this exercise, we've addressed it by snapping points to the network. We could still have a problem if one of our points snapped to, for instance, a hiking trail.
+2.  Your network includes islands. These might be literal islands (like the one we deleted from our study area!), or if they aren't, you might have a point that only connects to road like a race track or something that doesn't connect to the broader road network. It could also be that the point is closest to a "road" that doesn't allow cars (like a hiking trail).
+3.  Specific to r5r, the travel time matrix function allows you to set a maximum trip duration, with a default value of 120 minutes (two hours). If some points in your study area are farther away than this from other points, they won't be included in your travel time matrix.
+
+## Apply a gravity model
+
+Now we are ready to use a gravity model to distribute trips from each production zone among all possible attraction zones.
+
+The gravity model is based on the idea that the attractiveness of a zone to a production increases with the number of attractions in it and decreases with the cost of travel (where the primary cost is travel time) from the production. A decay function can describe the relationship between travel time and attractiveness. The "classic" gravity model uses an exponential decay function, which has the form:
+
+$$ f(c_{ij}) = exp(-βc_{ij})  $$
+
+Where:
+
+-   $f(c_ij)$ is the friction between zones i and j,
+
+-   $c_ij$ is the travel time (or generalized travel cost) between zones i and j, and
+
+-   *β* is a parameter that describes how sensitive travelers are to travel time. Any positive value of *β* would imply that places become less attractive as they get further away, and higher values indicate greater sensitivity to travel time. A negative value of *β* indicates that there is a preference for places that are farther away (this would be a problem). Here is an image illustrating the relationship between travel time and the attractiveness of a destination for different values of *β* in a classic gravity model.
+
+```{r draw-friction}
+friction <- tibble(`Travel time (min)` = seq(0, 30, by=1)) |>
+  mutate(`β = -0.001` = exp(0.001 * `Travel time (min)`),
+         `β = 0.050` = exp(-0.050 * `Travel time (min)`),
+         `β = 0.200` = exp(-0.200 * `Travel time (min)`),
+         `β = 0.500` = exp(-0.500 * `Travel time (min)`),
+         `β = 1.000` = exp(-1.000 * `Travel time (min)`)) |>
+  pivot_longer(cols = -`Travel time (min)`,
+               names_to = "betas") |>
+  rename(`Destination attractiveness` = value)
+
+ggplot(friction) +
+  geom_line(aes(x = `Travel time (min)`,
+                y = `Destination attractiveness`,
+                linetype = betas)) +
+  scale_x_continuous(breaks = seq(0, 30, by=5)) +
+  scale_y_continuous(breaks = seq(0, 1.1, by=0.1)) +
+  theme_minimal()
+```
+
+### Select a decay function parameter
+
+How sensitive to travel times are people making trips for a particular purpose in a particular region? What is the right value of *β* to use? Let's start by calculating the average travel time for each trip type.
+
+```{r calc-avg-tt, message=FALSE}
+flow_tt <- pa_data |>
+  rename(from_id = h_geocode,
+         to_id = w_geocode) |>
+  right_join(skim) |>
+  rename(flow_total = S000,
+         flow_goods = SI01,
+         flow_trade = SI02,
+         flow_serve = SI03) |>
+  replace_na(list(flow_total = 0,
+                  flow_goods = 0,
+                  flow_trade = 0,
+                  flow_serve = 0))
+
+avg_tts <- tibble(`Worker sector` = c("Goods", "Trade", "Service", "Total"),
+                  `Average travel time (observed)` = c(
+                    sum(flow_tt$flow_goods * flow_tt$travel_time_p50) / 
+                      sum(flow_tt$flow_goods),
+                    sum(flow_tt$flow_trade * flow_tt$travel_time_p50) / 
+                      sum(flow_tt$flow_trade),
+                    sum(flow_tt$flow_serve * flow_tt$travel_time_p50) / 
+                      sum(flow_tt$flow_serve),
+                    sum(flow_tt$flow_total * flow_tt$travel_time_p50) / 
+                      sum(flow_tt$flow_total)))
+                  
+kable(avg_tts, digits = 1)
+```
+
+On average, workers in goods-producing industries live 23 minutes from their work places, workers in trade and retail industries live 20 minutes from their work places and workers in service industries live 21 minutes from their work places. Among all workers, the average travel time from home to work is about 21 minutes.
+
+For an exponential decay curve a reasonable starting point to guess would be $\frac{1}{c*}$ , where c\* is the average travel time among our observed work trips.
+
+```{r calc-betas}
+
+betas <- 1/avg_tts$`Average travel time (observed)`
+names(betas) <- c("Goods", "Trade", "Service", "Total")
+
+initial_betas <- tibble(`Worker sector` = names(betas),
+                  `Initial β value` = betas)
+                  
+kable(initial_betas, digits = 3)
+```
+
+Here's a quick visualization of the sensitivity to travel time those values imply for the journey to work in different industries.
+
+```{r draw-betas}
+friction <- tibble(`Travel time (min)` = seq(0, 30, by=1)) |>
+  mutate(Goods = exp(-1 * betas["Goods"] * `Travel time (min)`),
+         Trade = exp(-1 * betas["Trade"] * `Travel time (min)`),
+         Service = exp(-1 * betas["Service"] * `Travel time (min)`),
+         `All industries` = exp(-1 * betas["Total"] * `Travel time (min)`)) |>
+  pivot_longer(cols = -`Travel time (min)`,
+               names_to = "Industry") |>
+  rename(`Destination attractiveness` = value)
+
+ggplot(friction) +
+  geom_line(aes(x = `Travel time (min)`,
+                y = `Destination attractiveness`,
+                linetype = Industry)) +
+  scale_x_continuous(breaks = seq(0, 30, by=5)) +
+  scale_y_continuous(breaks = seq(0, 1.1, by=0.1)) +
+  theme_minimal()
+```
+
+### Calculate friction factors
+
+So now we can apply those beta values to calculate the friction factors between zones.
+
+```{r}
+flow_tt <- flow_tt |>
+  mutate(friction_goods = exp(-1 * betas["Goods"] * travel_time_p50),
+         friction_trade = exp(-1 * betas["Trade"] * travel_time_p50),
+         friction_serve = exp(-1 * betas["Service"] * travel_time_p50),
+         friction_total = exp(-1 * betas["Total"] * travel_time_p50))
+```
+
+```{r initial-matrix, eval=FALSE}
+
+flow_goods_est <- grvty_balancing(od_zones = trip_gen,
+                                  friction = flow_tt,
+                                  zone_id = "geocode",
+                                  zone_o = "goods_p",
+                                  zone_d = "goods_a",
+                                  friction_o_id = "from_id",
+                                  friction_d_id = "to_id",
+                                  friction_factor = "friction_goods",
+                                  tolerance = 0.001,
+                                  max_iter = 100)
+
+flow_trade_est <- grvty_balancing(od_zones = trip_gen,
+                                  friction = flow_tt,
+                                  zone_id = "geocode",
+                                  zone_o = "trade_p",
+                                  zone_d = "trade_a",
+                                  friction_o_id = "from_id",
+                                  friction_d_id = "to_id",
+                                  friction_factor = "friction_trade",
+                                  tolerance = 0.001,
+                                  max_iter = 100)
+
+flow_serve_est <- grvty_balancing(od_zones = trip_gen,
+                                  friction = flow_tt,
+                                  zone_id = "geocode",
+                                  zone_o = "serve_p",
+                                  zone_d = "serve_a",
+                                  friction_o_id = "from_id",
+                                  friction_d_id = "to_id",
+                                  friction_factor = "friction_serve",
+                                  tolerance = 0.001,
+                                  max_iter = 100)
+
+flow_total_est <- grvty_balancing(od_zones = trip_gen,
+                                  friction = flow_tt,
+                                  zone_id = "geocode",
+                                  zone_o = "total_p",
+                                  zone_d = "total_a",
+                                  friction_o_id = "from_id",
+                                  friction_d_id = "to_id",
+                                  friction_factor = "friction_total",
+                                  tolerance = 0.001,
+                                  max_iter = 100)
+
+```
+
+The `grvty_balancing` function returns two data frames. The first (convergence) is a record of the iterations towards getting a balanced set of productions and attractions. And the second (flows) is the estimated flow for each origin-destination (or production-attraction) pair.
+
+Those took a long time to run, so I'm going to save the flow tables to file to avoid having to keep rerunning it.
+
+```{r write-init-flows, eval=FALSE}
+
+write_csv(flow_goods_est$flows,
+          file = here("P4",
+                      "data",
+                      "init-goods-flow.csv"))
+
+write_csv(flow_trade_est$flows,
+          file = here("P4",
+                      "data",
+                      "init-trade-flow.csv"))
+
+write_csv(flow_serve_est$flows,
+          file = here("P4",
+                      "data",
+                      "init-serve-flow.csv"))
+
+write_csv(flow_total_est$flows,
+          file = here("P4",
+                      "data",
+                      "init-total-flow.csv"))
+```
+
+## Evaluate model fit
+
+How close did the estimated P-A flows come to the observed flows?
+
+### Average travel time
+
+We can start by comparing the average estimated travel time to the average observed travel time.
+
+```{r calc-est-tt-init, message=FALSE}
+flow_goods <- here("P4",
+                   "data",
+                   "init-goods-flow.csv") |>
+  read_csv(col_types = "ccn") |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         goods_flow_est = flow)
+
+flow_trade <- here("P4",
+                   "data",
+                   "init-trade-flow.csv") |>
+  read_csv(col_types = "ccn") |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         trade_flow_est = flow)
+
+flow_serve <- here("P4",
+                   "data",
+                   "init-serve-flow.csv") |>
+  read_csv(col_types = "ccn") |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         serve_flow_est = flow)
+
+flow_total <- here("P4",
+                   "data",
+                   "init-total-flow.csv") |>
+  read_csv(col_types = "ccn") |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         total_flow_est = flow)
+
+flow_tt <- flow_tt |>
+  left_join(flow_goods) |>
+  left_join(flow_trade) |>
+  left_join(flow_serve) |> 
+  left_join(flow_total)
+
+avg_tts <- avg_tts |>
+  mutate(`Average travel time (estimated)` = c(
+    sum(flow_tt$goods_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$goods_flow_est),
+    sum(flow_tt$trade_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$trade_flow_est),
+    sum(flow_tt$serve_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$serve_flow_est),
+    sum(flow_tt$total_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$total_flow_est)))
+
+avg_tts |>
+  kable(digits = 1)
+```
+
+It looks like the average travel times from the gravity model estimates are lower than what we observed in our data, which might suggest that people are less sensitive to travel time than our initial beta values suggest.
+
+### Root Mean Squared Error
+
+A metric like Root Mean Squared Error can be another useful measure of the accuracy of the model, since two very different distributions can have similar average values.
+
+```{r calc-rmse-init}
+
+avg_tts <- avg_tts |>
+  mutate(rmse = c((mean((flow_tt$flow_goods - flow_tt$goods_flow_est)^2))^0.5,
+                  (mean((flow_tt$flow_trade - flow_tt$trade_flow_est)^2))^0.5,
+                  (mean((flow_tt$flow_serve - flow_tt$serve_flow_est)^2))^0.5,
+                  (mean((flow_tt$flow_total - flow_tt$total_flow_est)^2))^0.5))
+
+kable(avg_tts, digits = 2)
+```
+
+### Visual comparison
+
+We can also visualize the difference.
+
+Here's a little function that can generate a plot comparing estimated values to observed values.
+
+```{r plot-function}
+plot_flows <- function(flow_df,
+                       obs_col_name,
+                       est_col_name) {
+  
+  summary <- flow_df |>
+    rename(obs = all_of(obs_col_name),
+           est = all_of(est_col_name)) |>
+    group_by(obs, est) |>
+    summarize(n = n()) 
+  
+  max_scale <- max(summary$obs, summary$est)
+  my_interval <- ceiling(max_scale / 10)
+  dot_size <- floor(70 / max_scale)
+  
+  max_n_exp = round(log10(max(summary$n)))
+  
+  ggplot(summary) +
+    geom_point(aes(x = obs,
+                   y = est,
+                   color = n),
+               size = dot_size) +
+    scale_x_continuous(name = "Observed flow", 
+                       limits = c(0, max_scale),
+                       breaks = seq(0, max_scale, by=my_interval)) +
+    scale_y_continuous(name = "Estimated flow", 
+                       limits = c(0, max_scale),
+                       breaks = seq(0, max_scale, by=my_interval)) +
+    scale_color_viridis_c(transform = "log",
+                          breaks = my_breaks <- c(10^seq(-1, 
+                                                         max_n_exp, 
+                                                         by=1)),
+                          labels = formatC(my_breaks, format = "d", 
+                                           big.mark = ","),
+                          direction = -1,
+                          name = "Number of P-A pairs") +
+    theme_minimal()
+  
+    
+}
+    
+```
+
+Here's the comparison for the goods sector:
+
+```{r plot-goods-init, message=FALSE}
+plot_flows(flow_tt, 
+           obs_col_name = "flow_goods",
+           est_col_name = "goods_flow_est")
+
+
+```
+
+And for the trade sector:
+
+```{r plot-trade-init, message=FALSE}
+plot_flows(flow_tt, 
+           obs_col_name = "flow_trade",
+           est_col_name = "trade_flow_est")
+```
+
+For the service sector:
+
+```{r plot-service-init, message=FALSE}
+
+plot_flows(flow_tt, 
+           obs_col_name = "flow_serve",
+           est_col_name = "serve_flow_est")
+
+```
+
+And here it is for all jobs combined.
+
+```{r plot-total-init, message=FALSE}
+plot_flows(flow_tt, 
+           obs_col_name = "flow_total",
+           est_col_name = "total_flow_est")
+```
+
+## Calibrate the gravity model
+
+```{r calibrate, eval=FALSE}
+flow_tt <- flow_tt |>
+  select(-goods_flow_est,
+         -trade_flow_est,
+         -serve_flow_est,
+         -total_flow_est)
+
+## Calibrate goods beta
+calibrated_flows_goods <- grvty_calibrate(obs_flow_tt = flow_tt,
+                                          o_id_col = "from_id",
+                                          d_id_col = "to_id",
+                                          obs_flow_col = "flow_goods",
+                                          tt_col = "travel_time_p50",
+                                          tolerance_balancing = 0.0001,
+                                          max_iter_balancing = 30,
+                                          tolerance_calibration = 0.2,
+                                          max_iter_calibration = 30)
+
+beta_goods <- calibrated_flows_goods$beta
+
+goods_flow_est <- calibrated_flows_goods$flows |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         goods_flow_est = flow_est) |>
+  select(from_id, to_id, goods_flow_est)
+
+flow_tt <- flow_tt |>
+  left_join(goods_flow_est)
+
+## Calibrate trade beta
+calibrated_flows_trade <- grvty_calibrate(obs_flow_tt = flow_tt,
+                                          o_id_col = "from_id",
+                                          d_id_col = "to_id",
+                                          obs_flow_col = "flow_trade",
+                                          tt_col = "travel_time_p50",
+                                          tolerance_balancing = 0.0001,
+                                          max_iter_balancing = 30,
+                                          tolerance_calibration = 0.2,
+                                          max_iter_calibration = 30)
+
+beta_trade <- calibrated_flows_trade$beta
+
+trade_flow_est <- calibrated_flows_trade$flows |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         trade_flow_est = flow_est) |>
+  select(from_id, to_id, trade_flow_est)
+
+flow_tt <- flow_tt |>
+  left_join(trade_flow_est)
+
+## calibrate service beta
+calibrated_flows_serve <- grvty_calibrate(obs_flow_tt = flow_tt,
+                                          o_id_col = "from_id",
+                                          d_id_col = "to_id",
+                                          obs_flow_col = "flow_serve",
+                                          tt_col = "travel_time_p50",
+                                          tolerance_balancing = 0.0001,
+                                          max_iter_balancing = 30,
+                                          tolerance_calibration = 0.2,
+                                          max_iter_calibration = 30)
+
+beta_serve <- calibrated_flows_serve$beta
+
+serve_flow_est <- calibrated_flows_serve$flows |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         serve_flow_est = flow_est) |>
+  select(from_id, to_id, serve_flow_est)
+
+flow_tt <- flow_tt |>
+  left_join(serve_flow_est)
+
+## calibrate total beta
+calibrated_flows_total <- grvty_calibrate(obs_flow_tt = flow_tt,
+                                          o_id_col = "from_id",
+                                          d_id_col = "to_id",
+                                          obs_flow_col = "flow_total",
+                                          tt_col = "travel_time_p50",
+                                          tolerance_balancing = 0.0001,
+                                          max_iter_balancing = 30,
+                                          tolerance_calibration = 0.2,
+                                          max_iter_calibration = 30)
+
+beta_total <- calibrated_flows_total$beta
+
+total_flow_est <- calibrated_flows_total$flows |>
+  rename(from_id = o_id,
+         to_id = d_id,
+         total_flow_est = flow_est) |>
+  select(from_id, to_id, total_flow_est)
+
+flow_tt <- flow_tt |>
+  left_join(total_flow_est)
+
+betas_table <- tibble(Industry = c("Goods", 
+                                   "Trade",
+                                   "Service",
+                                   "Total"),
+                      beta_initial = betas,
+                      beta_calibrated = c(beta_goods,
+                                          beta_trade,
+                                          beta_serve,
+                                          beta_total))
+write_csv(flow_tt,
+          here("P4",
+               "data",
+               "calib-flows.csv"))
+
+write_csv(betas_table,
+          here("P4",
+               "data",
+               "calib-betas.csv"))
+
+```
+
+## Evaluate model fit
+
+Let's re-evaluate our model fit.
+
+### Average travel time
+
+Let's see if our averages are any closer.
+
+```{r}
+flow_tt %>%
+  filter(flow_goods > 0) %>%
+  nrow()
+```
+
+```{r new-avg-tt, message=FALSE}
+
+flow_tt <- here("P4",
+                "data",
+                "calib-flows.csv") |>
+  read_csv()
+
+avg_tts <- avg_tts |>
+  select(-rmse) |>
+  mutate(`Average travel time (estimated)` = c(
+    sum(flow_tt$goods_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$goods_flow_est),
+    sum(flow_tt$trade_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$trade_flow_est),
+    sum(flow_tt$serve_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$serve_flow_est),
+    sum(flow_tt$total_flow_est * flow_tt$travel_time_p50) / 
+      sum(flow_tt$total_flow_est)))
+
+avg_tts |>
+  kable(digits = 1)
+```
+
+### Root Mean Squared Error
+
+And let's check the RMSE.
+
+```{r new-rmse}
+
+avg_tts <- avg_tts |>
+  mutate(rmse = c((mean((flow_tt$flow_goods - flow_tt$goods_flow_est)^2))^0.5,
+                  (mean((flow_tt$flow_trade - flow_tt$trade_flow_est)^2))^0.5,
+                  (mean((flow_tt$flow_serve - flow_tt$serve_flow_est)^2))^0.5,
+                  (mean((flow_tt$flow_total - flow_tt$total_flow_est)^2))^0.5))
+
+kable(avg_tts, digits = 2)
+```
+
+### Visual comparison
+
+And let's see a plot of our estimated and observed flows for goods-producing workers.
+
+```{r new-plot-goods, message=FALSE}
+plot_flows(flow_tt,
+           obs_col_name = "flow_goods",
+           est_col_name = "goods_flow_est")
+```
+
+And for trade workers:
+
+```{r new-plot-trade, message=FALSE}
+plot_flows(flow_tt,
+           obs_col_name = "flow_trade",
+           est_col_name = "trade_flow_est")
+```
+
+And for service workers:
+
+```{r new-plot-service, message=FALSE}
+
+plot_flows(flow_tt,
+           obs_col_name = "flow_serve",
+           est_col_name = "serve_flow_est")
+```
+
+And for all workers
+
+```{r new-plot-all, message=FALSE}
+
+plot_flows(flow_tt,
+           obs_col_name = "flow_total",
+           est_col_name = "total_flow_est")
+
+```
+
+## Interpret calibrated parameters
+
+Calibrating the beta parameter improved the fit of the model. What do the difference in these values tell us about people's travel choices?
+
+```{r plot-final-betas, message=FALSE}
+
+
+betas_table <- here("P4",
+                    "data",
+                    "calib-betas.csv") |> 
+  read_csv()
+
+friction <- tibble(`Travel time (min)` = seq(1, 60, by=1)) |>
+  mutate(Goods = exp(-1 * betas_table$beta_calibrated[1] * `Travel time (min)`),
+         Trade = exp(-1 * betas_table$beta_calibrated[2] * `Travel time (min)`),
+         Service = exp(-1 * betas_table$beta_calibrated[3] * `Travel time (min)`),
+         `All industries` = 
+           exp(-1 * betas_table$beta_calibrated[4] * `Travel time (min)`)) |>
+  pivot_longer(cols = -`Travel time (min)`,
+               names_to = "Sector") |>
+  rename(`Destination attractiveness` = value) |>
+  filter(`Destination attractiveness` < 2)
+
+ggplot(friction) +
+  geom_line(aes(x = `Travel time (min)`,
+                y = `Destination attractiveness`,
+                linetype = Sector)) +
+  scale_x_continuous(breaks = seq(0, 60, by=5)) +
+  scale_y_continuous(breaks = seq(0, 2, by=0.1),
+                     limits = c(0, 1.5)) +
+  theme_minimal()
+```
